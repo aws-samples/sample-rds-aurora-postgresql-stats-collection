@@ -242,8 +242,13 @@ class InvasiveCollector(NonInvasiveCollector):
             self.logger.error(f"Error collecting database statistics: {e}")
             raise
 
-    def collect_configuration_parameters(self) -> Dict[str, Any]:
-        """Collect PostgreSQL configuration parameters."""
+    def collect_configuration_parameters(self, database_info: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Collect PostgreSQL configuration parameters via direct DB connection.
+        
+        The database_info parameter is accepted for compatibility with the
+        parent class (NonInvasiveCollector) but is not used — the invasive
+        collector already has a DB connection and queries pg_settings directly.
+        """
         try:
             self.logger.info("Collecting configuration parameters")
             
@@ -1256,7 +1261,12 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
             # Apply PII redaction before writing to disk
             query_hash_map = {}
             if not getattr(self, '_skip_redaction', False):
-                from utils.pii_redactor import PiiRedactor
+                try:
+                    from utils.pii_redactor import PiiRedactor
+                except ImportError:
+                    _script_dir = os.path.dirname(os.path.realpath(__file__))
+                    sys.path.insert(0, os.path.dirname(_script_dir))
+                    from utils.pii_redactor import PiiRedactor
                 redactor = PiiRedactor()
                 collected_data, query_hash_map = redactor.redact(collected_data)
                 self.logger.info("PII redaction applied")

@@ -695,7 +695,13 @@ class NonInvasiveCollector:
             
             # Apply PII redaction before writing to disk
             if not getattr(self, '_skip_redaction', False):
-                from utils.pii_redactor import PiiRedactor
+                try:
+                    from utils.pii_redactor import PiiRedactor
+                except ImportError:
+                    # Resolve path when running from symlink or different cwd
+                    _script_dir = os.path.dirname(os.path.realpath(__file__))
+                    sys.path.insert(0, os.path.dirname(_script_dir))
+                    from utils.pii_redactor import PiiRedactor
                 redactor = PiiRedactor()
                 collected_data, _ = redactor.redact(collected_data)
                 self.logger.info("PII redaction applied")
