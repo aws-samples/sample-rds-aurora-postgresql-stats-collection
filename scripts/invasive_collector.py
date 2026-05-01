@@ -726,6 +726,17 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
             self.logger.error(f"Error setting up PGSnapper cron: {e}")
             raise
     
+    @staticmethod
+    def _format_remaining_time(remaining_days: float) -> str:
+        """Format remaining wait time in human-readable units."""
+        minutes = remaining_days * 24 * 60
+        if minutes < 60:
+            return f'Need {minutes:.0f} more minute(s)'
+        hours = remaining_days * 24
+        if hours < 24:
+            return f'Need {hours:.1f} more hour(s)'
+        return f'Need {remaining_days:.1f} more day(s)'
+
     def check_pgsnapper_data_age(self, output_dir: str, min_days: int = 3) -> Dict[str, Any]:
         """Check age and count of collected PGSnapper snapshots."""
         try:
@@ -754,7 +765,7 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
                 'snapshots': len(snap_files),
                 'oldest_snapshot': oldest_time.isoformat(),
                 'newest_snapshot': newest_time.isoformat(),
-                'message': f'{days_collected:.1f} days of data collected' if days_collected >= min_days else f'Need {min_days - days_collected:.1f} more days'
+                'message': f'{days_collected:.1f} days of data collected' if days_collected >= min_days else self._format_remaining_time(min_days - days_collected)
             }
             
         except Exception as e:
