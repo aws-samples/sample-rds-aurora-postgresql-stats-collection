@@ -698,13 +698,18 @@ class NonInvasiveCollector:
                 try:
                     from utils.pii_redactor import PiiRedactor
                 except ImportError:
-                    # Resolve path when running from symlink or different cwd
-                    _script_dir = os.path.dirname(os.path.realpath(__file__))
-                    sys.path.insert(0, os.path.dirname(_script_dir))
-                    from utils.pii_redactor import PiiRedactor
-                redactor = PiiRedactor()
-                collected_data, _ = redactor.redact(collected_data)
-                self.logger.info("PII redaction applied")
+                    try:
+                        # Resolve path when running from symlink or different cwd
+                        _script_dir = os.path.dirname(os.path.realpath(__file__))
+                        sys.path.insert(0, os.path.dirname(_script_dir))
+                        from utils.pii_redactor import PiiRedactor
+                    except ImportError:
+                        self.logger.warning("PII redaction skipped — utils/pii_redactor.py not found")
+                        PiiRedactor = None
+                if PiiRedactor:
+                    redactor = PiiRedactor()
+                    collected_data, _ = redactor.redact(collected_data)
+                    self.logger.info("PII redaction applied")
             
             # Save to file
             output_file = os.path.join(self.output_dir, f"{db_id}_non_invasive_data.json")

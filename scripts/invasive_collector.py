@@ -1264,11 +1264,16 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
                 try:
                     from utils.pii_redactor import PiiRedactor
                 except ImportError:
-                    _script_dir = os.path.dirname(os.path.realpath(__file__))
-                    sys.path.insert(0, os.path.dirname(_script_dir))
-                    from utils.pii_redactor import PiiRedactor
-                redactor = PiiRedactor()
-                collected_data, query_hash_map = redactor.redact(collected_data)
+                    try:
+                        _script_dir = os.path.dirname(os.path.realpath(__file__))
+                        sys.path.insert(0, os.path.dirname(_script_dir))
+                        from utils.pii_redactor import PiiRedactor
+                    except ImportError:
+                        self.logger.warning("PII redaction skipped — utils/pii_redactor.py not found")
+                        PiiRedactor = None
+                if PiiRedactor:
+                    redactor = PiiRedactor()
+                    collected_data, query_hash_map = redactor.redact(collected_data)
                 self.logger.info("PII redaction applied")
             
             # Save to file
