@@ -1059,6 +1059,7 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
             # Write status file for collect-and-share.sh to read
             if status_file:
                 status_data = {
+                    'status': 'analyzed' if data_status.get('ready') else 'collecting',
                     'pgsnapper_days_collected': data_status.get('days', 0),
                     'pgsnapper_min_days_required': min_days,
                     'pgsnapper_snapshots': data_status.get('snapshots', 0),
