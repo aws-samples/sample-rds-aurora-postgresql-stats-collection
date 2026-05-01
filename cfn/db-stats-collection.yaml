@@ -544,5 +544,5 @@ Outputs:
     Value: !Sub 'Enabled: ${EnableScheduledCollection}, Schedule: ${CollectionSchedule}'
   
   SAInstructions:
-    Description: Instructions for SA to access customer data
-    Value: !Sub 'SA can access customer data at: s3://${ResolvedDataBucketName}/db-stats/'
+    Description: S3 location of collected DB stats
+    Value: !Sub 'Collected DB stats available at: s3://${ResolvedDataBucketName}/db-stats/'

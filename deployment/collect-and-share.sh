@@ -172,17 +172,20 @@ if [ -n "$DATA_BUCKET" ]; then
   NEXT_STEPS=""
   if ! compgen -G "$FLAGS_DIR/*.flag" > /dev/null 2>&1; then
     NEXT_STEPS="Next Steps:
-1. Notify your SA that data collection is complete
-2. Provide S3 bucket access: $DATA_BUCKET"
+1. Share collected data with your SA
+2. Download the collected data from S3 and share it with your SA via a support case:
+   aws s3 sync s3://$DATA_BUCKET/db-stats/ ./db-stats-export/"
   elif [ "$NEEDS_SETUP" = true ]; then
     NEXT_STEPS="Next Steps:
 1. Wait for $WAIT_DAYS day(s) worth of snapshots
 2. Re-run ./collect-and-share.sh
-3. Provide S3 bucket access: $DATA_BUCKET"
+3. Download the collected data from S3 and share it with your SA via a support case:
+   aws s3 sync s3://$DATA_BUCKET/db-stats/ ./db-stats-export/"
   else
     NEXT_STEPS="Next Steps:
-1. Notify your SA that data collection is complete
-2. Provide S3 bucket access: $DATA_BUCKET"
+1. Share collected data with your SA
+2. Download the collected data from S3 and share it with your SA via a support case:
+   aws s3 sync s3://$DATA_BUCKET/db-stats/ ./db-stats-export/"
   fi
 
   cat > "$DATA_DIR/sa-sharing-instructions.txt" << INSTRUCTIONS

@@ -8,7 +8,7 @@ Deploys a lightweight EC2 instance in your AWS account that:
 - Discovers all PostgreSQL databases (Aurora and RDS) in your account/region
 - Collects CloudWatch metrics, Performance Insights data, and database configuration
 - Collects deeper database statistics (requires AWS Secrets Manager to access DB from your account)
-- Uploads collected data to an S3 bucket for your SA to access
+- Uploads collected data to an S3 bucket in your account for review
 
 ## Prerequisites
 
@@ -195,12 +195,15 @@ rm -f data/flags/*.flag
 > crontab -l | grep -v 'pgsnapper_snap.sh' | crontab -
 > ```
 
-## Step 4: Share data with your SA
+## Step 4: Share collected data with your SA
 
-Provide your SA with read access to the S3 bucket printed at the end of the deploy script:
+Download the collected data from S3 and share it with your SA via a support case:
 
-```
-s3://wal-db-stats-collection-<account-id>/db-stats/
+```bash
+# Download the data package locally
+aws s3 sync s3://wal-db-stats-collection-<account-id>/db-stats/ ./db-stats-export/
+
+# Then attach the data to your support case or share via your preferred secure channel
 ```
 
 Your SA will use this data to perform Well Architected Review and provide you with a comprehensive report.
@@ -228,7 +231,7 @@ Your SA will use this data to perform Well Architected Review and provide you wi
 - All data is encrypted in transit (HTTPS/TLS) and at rest (S3 SSE)
 - The S3 bucket is private with public access blocked
 - Data is automatically deleted from S3 after 30 days
-- You retain full control of the S3 bucket and can revoke SA access at any time
+- You retain full control of the S3 bucket — data stays in your account
 
 ### PII handling
 
