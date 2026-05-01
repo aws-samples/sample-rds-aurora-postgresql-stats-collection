@@ -762,15 +762,20 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
             oldest_time = datetime.fromtimestamp(min(file_times))
             newest_time = datetime.fromtimestamp(max(file_times))
             
-            days_collected = (newest_time - oldest_time).total_seconds() / 86400
+            # Measure time since first snapshot was created (not file span —
+            # PGSnapper may overwrite files, making newest == oldest)
+            now = datetime.now()
+            days_since_first = (now - oldest_time).total_seconds() / 86400
+            
+            ready = days_since_first >= min_days
             
             return {
-                'ready': days_collected >= min_days,
-                'days': round(days_collected, 2),
+                'ready': ready,
+                'days': round(days_since_first, 2),
                 'snapshots': len(snap_files),
                 'oldest_snapshot': oldest_time.isoformat(),
                 'newest_snapshot': newest_time.isoformat(),
-                'message': f'{days_collected:.1f} days of data collected' if days_collected >= min_days else self._format_remaining_time(min_days - days_collected)
+                'message': f'{days_since_first:.1f} days of data collected ({len(snap_files)} snapshots)' if ready else self._format_remaining_time(min_days - days_since_first) if days_since_first < min_days else f'Only {len(snap_files)} snapshot(s) found, need at least {min_snapshots}'
             }
             
         except Exception as e:
@@ -862,7 +867,7 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
             
             # If no snapshots in the time window, use all available snapshots
             if not begin_snap_id or not end_snap_id:
-                self.logger.warning(f"No snapshots found in last {min_days} days, using all available snapshots")
+                self.logger.info(f"No snapshots found in last {min_days} days, using all available snapshots")
                 get_all_snaps_cmd = [
                     'sudo', '-u', 'postgres', 'psql',
                     '-d', analysis_db,
@@ -972,7 +977,7 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
                     # Skip queries that need pg_stat_statements if skipped or no data
                     if analysis_name in requires_statements and (skip_pg_stat_statements or stmt_count == 0):
                         self.logger.warning(f"Skipping {analysis_name} - no pg_stat_statements data available")
-                        analysis_results[analysis_name] = {'columns': columns, 'data': []}
+                        analysis_results[analysis_name] = []
                         continue
                     # Check fixed SQL directory first for queries that need fixes
                     if sql_file.endswith('_fixed.sql'):
@@ -1000,7 +1005,7 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
                             for line in result.stdout.strip().split('\n'):
                                 if line:
                                     rows.append(line.split('|'))
-                            analysis_results[analysis_name] = {'columns': columns, 'data': rows}
+                            analysis_results[analysis_name] = rows
                             self.logger.info(f"Collected {len(rows)} rows for {analysis_name}")
                         else:
                             error_msg = result.stderr if result.stderr else 'Query returned no data'
@@ -1008,10 +1013,10 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
                                 self.logger.warning(f"Skipping {analysis_name} - incompatible with PostgreSQL version: {error_msg.split('ERROR:')[1].strip() if 'ERROR:' in error_msg else error_msg}")
                             else:
                                 self.logger.error(f"Error running {analysis_name}: {error_msg}")
-                            analysis_results[analysis_name] = {'columns': columns, 'data': []}
+                            analysis_results[analysis_name] = []
                     else:
                         self.logger.warning(f"SQL file not found: {sql_path}")
-                        analysis_results[analysis_name] = {'columns': columns, 'data': []}
+                        analysis_results[analysis_name] = []
                         
                 except Exception as e:
                     self.logger.error(f"Error running {analysis_name}: {e}")
@@ -1075,19 +1080,48 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
                     json.dump(status_data, f, indent=2)
             
             if not data_status['ready']:
-                self.logger.info(f"PGSnapper data not ready: {data_status.get('message')}")
+                remaining_seconds = (min_days - data_status.get('days', 0)) * 86400
                 
-                try:
-                    self.setup_pgsnapper_cron(snap_interval_minutes)
-                    cron_status = 'configured'
-                    cron_message = f"PGSnapper cron job configured to collect snapshots every {snap_interval_minutes} minutes."
-                except Exception as cron_error:
-                    self.logger.error(f"Failed to setup PGSnapper cron: {cron_error}")
-                    cron_status = 'failed'
-                    cron_message = f"Failed to setup cron job: {cron_error}. Please install cronie: sudo dnf install -y cronie && sudo systemctl start crond"
+                # If remaining wait is short (under 30 minutes), wait and retry
+                if remaining_seconds <= 1800:
+                    # Minimum 60s wait (one snapshot interval) even if math says 0
+                    wait_seconds = max(remaining_seconds + 30, 60)
+                    wait_minutes = int(wait_seconds / 60) + 1
+                    self.logger.info(f"PGSnapper data not ready — waiting {wait_minutes} minute(s) for snapshots to accumulate...")
+                    
+                    # Ensure cron is running
+                    try:
+                        self.setup_pgsnapper_cron(snap_interval_minutes)
+                    except Exception:
+                        pass  # Cron may already be installed
+                    
+                    import time as _time
+                    _time.sleep(wait_seconds)
+                    
+                    # Re-check
+                    data_status = self.check_pgsnapper_data_age(output_dir, min_days)
+                    if status_file:
+                        status_data['status'] = 'analyzed' if data_status.get('ready') else 'collecting'
+                        status_data['pgsnapper_days_collected'] = data_status.get('days', 0)
+                        status_data['pgsnapper_snapshots'] = data_status.get('snapshots', 0)
+                        status_data['pgsnapper_ready'] = data_status.get('ready', False)
+                        with open(status_file, 'w', encoding='utf-8') as f:
+                            json.dump(status_data, f, indent=2)
                 
-                return {
-                    'status': 'collecting',
+                if not data_status['ready']:
+                    self.logger.info(f"PGSnapper data not ready: {data_status.get('message')}")
+                    
+                    try:
+                        self.setup_pgsnapper_cron(snap_interval_minutes)
+                        cron_status = 'configured'
+                        cron_message = f"PGSnapper cron job configured to collect snapshots every {snap_interval_minutes} minutes."
+                    except Exception as cron_error:
+                        self.logger.error(f"Failed to setup PGSnapper cron: {cron_error}")
+                        cron_status = 'failed'
+                        cron_message = f"Failed to setup cron job: {cron_error}. Please install cronie: sudo dnf install -y cronie && sudo systemctl start crond"
+                    
+                    return {
+                        'status': 'collecting',
                     'cron_status': cron_status,
                     'message': cron_message,
                     'next_steps': f"Wait {min_days} days for data collection, then run this command again to analyze the collected data.",

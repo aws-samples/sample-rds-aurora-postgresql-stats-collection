@@ -139,9 +139,31 @@ ZIP_NAME="wal-db-stats-collection.zip"
 REPO_ROOT="$SCRIPT_DIR/.."
 ZIP_PATH="$REPO_ROOT/$ZIP_NAME"
 
-# Create zip from repo contents if it doesn't already exist
-if [ ! -f "$ZIP_PATH" ]; then
+    # Always recreate zip to ensure latest code
+    [ -f "$ZIP_PATH" ] && rm -f "$ZIP_PATH"
     echo "📦 Creating code package from repo contents..."
+    REQUIRED_FILES="
+        deployment/collect-and-share.sh
+        deployment/enable-invasive-collection.sh
+        scripts/non_invasive_collector.py
+        scripts/invasive_collector.py
+        utils/fleet_discovery.py
+        utils/pii_redactor.py
+        requirements.txt
+        README.md
+    "
+    MISSING=""
+    for f in $REQUIRED_FILES; do
+        if [ ! -f "$REPO_ROOT/$f" ]; then
+            MISSING="$MISSING  $f\n"
+        fi
+    done
+    if [ -n "$MISSING" ]; then
+        echo "❌ Cannot create deployment package — missing required files:"
+        echo -e "$MISSING"
+        echo "   Ensure you have the complete repo before deploying."
+        exit 1
+    fi
     (cd "$REPO_ROOT" && zip -r "$ZIP_NAME" \
         deployment/collect-and-share.sh \
         deployment/enable-invasive-collection.sh \
@@ -151,11 +173,11 @@ if [ ! -f "$ZIP_PATH" ]; then
         scripts/invasive_collector.py \
         scripts/pgsnapper_sql_fixes/ \
         utils/fleet_discovery.py \
+        utils/pii_redactor.py \
         requirements.txt \
         README.md \
         -x "*.DS_Store*" -q)
     echo "   Created $ZIP_NAME"
-fi
 
 echo "📦 Uploading code to S3..."
 aws s3 mb "s3://$CODE_BUCKET" --region "$REGION" 2>/dev/null || true

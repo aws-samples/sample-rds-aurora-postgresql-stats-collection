@@ -344,6 +344,17 @@ Resources:
             exit 1
           fi
           
+          # Validate required files are present
+          MISSING=""
+          for f in scripts/non_invasive_collector.py scripts/invasive_collector.py utils/fleet_discovery.py utils/pii_redactor.py deployment/collect-and-share.sh requirements.txt; do
+            [ ! -f "$f" ] && MISSING="$MISSING $f"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "❌ Deployment package incomplete — missing:$MISSING"
+            /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+            exit 1
+          fi
+          
           # Install Python packages for python3.11 (application code)
           python3.11 -m pip install --upgrade pip
           python3.11 -m pip install -r requirements.txt || {
