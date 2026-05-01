@@ -154,7 +154,7 @@ Database statistics and metrics collection requires **two runs** of `./collect-a
 
 > **Note**: If the initial snapshot fails during Run 1 (bad credentials, network issue, etc.), the cron job will **not** be installed. Fix the underlying issue and re-run `./collect-and-share.sh` — it will detect that setup is still needed and retry.
 
-With the example above (`pgsnapper-min-days=1`, `pgsnapper-interval=60`), wait at least 1 day between runs. For a quick test, use `pgsnapper-min-days=0.1` (~2.4 hours) and `pgsnapper-interval=1`.
+With the example above (`pgsnapper-min-days=1`, `pgsnapper-interval=60`), wait at least 1 day between runs. For a quick test, use `pgsnapper-min-days=0.01` (~15 minutes) and `pgsnapper-interval=1` (1 minute interval).
 
 ```bash
 # Run 1 — setup only: installs cron, verifies connectivity (no data collection)
@@ -232,13 +232,25 @@ Your SA will use this data to perform Well Architected Review and provide you wi
 
 ### PII handling
 
-Before any data is uploaded to S3, apply redaction if needed. The data collected returns:
+PII redaction runs **automatically** before any data is written to disk or uploaded to S3. The following fields are redacted by default:
 
-- **Database endpoints** (`endpoint`, `reader_endpoint`) for checking additionally from internal tools if needed
-- **Client IP addresses** in connection activity data - recommend apply one-way hashing (SHA-256, first 8 chars) if sensitive to your data handling policy
-- **Query text** from `pg_stat_statements` — PostgreSQL stores only parameterized form (e.g. `UPDATE t SET col = $1 WHERE id = $2`). 
-- **KMS key ARNs** - SA does NOT have access to the actual config associated with the KMS key ARNs. Only used for checking security best practices. Recommend trimming to the key alias only if sensitive to your data handling policy
-- **Database passwords** are never written to any output file — retrieved from Secrets Manager at runtime only
+- **Database endpoints** (`endpoint`, `reader_endpoint`) → masked to `<masked-endpoint>`
+- **Client IP addresses** in connection activity data → SHA-256 hash (first 8 chars)
+- **KMS key ARNs** → trimmed to key ID only (no account ID or region)
+- **Password hashes** in database health data → replaced with `<redacted>`
+- **Query text** — a `query_hash` field is added alongside each query for cross-referencing. The query text itself is **not removed** because `pg_stat_statements` stores only the parameterized form (e.g. `UPDATE t SET col = $1 WHERE id = $2`) which contains no customer data.
+
+**What is NOT redacted**:
+- Table, column, and schema names
+- All numeric metric values
+- Parameter names and settings
+- Database passwords are never written to any output file — retrieved from Secrets Manager at runtime only
+
+To **skip redaction** (e.g. for internal analysis where you need raw endpoints):
+
+```bash
+./collect-and-share.sh --no-redact
+```
 
 ## Cleanup
 

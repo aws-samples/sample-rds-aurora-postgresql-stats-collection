@@ -1241,10 +1241,25 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
             if pgsnapper_min_days > 0:
                 collected_data['pgsnapper'] = self.collect_pgsnapper_data(pgsnapper_min_days, pgsnapper_interval_minutes, status_file, skip_pg_stat_statements)
             
+            # Apply PII redaction before writing to disk
+            query_hash_map = {}
+            if not getattr(self, '_skip_redaction', False):
+                from utils.pii_redactor import PiiRedactor
+                redactor = PiiRedactor()
+                collected_data, query_hash_map = redactor.redact(collected_data)
+                self.logger.info("PII redaction applied")
+            
             # Save to file
             output_file = os.path.join(self.output_dir, f"{cluster_id}_invasive_data.json")
             with open(output_file, 'w', encoding='utf-8') as f:
                 json.dump(collected_data, f, indent=2, default=str)
+            
+            # Save query hash map (allows SA to look up original query text if needed)
+            if query_hash_map:
+                hash_map_file = os.path.join(self.output_dir, f"{cluster_id}_query_hash_map.json")
+                with open(hash_map_file, 'w', encoding='utf-8') as f:
+                    json.dump(query_hash_map, f, indent=2)
+                self.logger.info(f"Query hash map saved: {len(query_hash_map)} entries")
             
             self.logger.info(f"Invasive data collection completed. Output saved to {output_file}")
             return collected_data
@@ -1276,6 +1291,9 @@ def main():
                         help='Only install PGSnapper cron job, no data collection')
     parser.add_argument('--skip-non-invasive', action='store_true',
                         help='Skip internal non-invasive collection (already done by fleet)')
+    parser.add_argument('--no-redact', action='store_true',
+                        help='Skip PII redaction (endpoints, client IPs, KMS ARNs). '
+                             'Use only if you need the raw data for internal analysis.')
     
     args = parser.parse_args()
     
@@ -1310,6 +1328,7 @@ def main():
             output_dir=args.output_dir,
             db_secret_arn=args.db_secret_arn
         )
+        collector._skip_redaction = args.no_redact
         
         result = collector.collect_all_data(
             args.cluster_id,

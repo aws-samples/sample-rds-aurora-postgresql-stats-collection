@@ -693,6 +693,13 @@ class NonInvasiveCollector:
             # Collect Performance Insights data
             collected_data['performance_insights'] = self.collect_performance_insights(database_info)
             
+            # Apply PII redaction before writing to disk
+            if not getattr(self, '_skip_redaction', False):
+                from utils.pii_redactor import PiiRedactor
+                redactor = PiiRedactor()
+                collected_data, _ = redactor.redact(collected_data)
+                self.logger.info("PII redaction applied")
+            
             # Save to file
             output_file = os.path.join(self.output_dir, f"{db_id}_non_invasive_data.json")
             with open(output_file, 'w', encoding='utf-8') as f:
@@ -777,6 +784,9 @@ def main():
     parser.add_argument('--output-dir', default='./data', help='Output directory for collected data')
     parser.add_argument('--days', type=int, default=7, help='Number of days of metrics to collect')
     parser.add_argument('--max-workers', type=int, default=4, help='Maximum parallel workers for fleet collection')
+    parser.add_argument('--no-redact', action='store_true',
+                        help='Skip PII redaction (endpoints, client IPs, KMS ARNs). '
+                             'Use only if you need the raw data for internal analysis.')
     
     args = parser.parse_args()
     
@@ -791,6 +801,7 @@ def main():
     
     try:
         collector = NonInvasiveCollector(args.region, args.output_dir)
+        collector._skip_redaction = args.no_redact
         
         if args.fleet:
             # Fleet collection

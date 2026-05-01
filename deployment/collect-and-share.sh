@@ -8,6 +8,15 @@
 
 set -e
 
+# Parse arguments
+NO_REDACT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-redact) NO_REDACT="--no-redact"; shift ;;
+    *) echo "Unknown option: $1"; echo "Usage: $0 [--no-redact]"; exit 1 ;;
+  esac
+done
+
 # Load config (written by UserData during deployment)
 REAL_SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 CONFIG_FILE="$(dirname "$REAL_SCRIPT_PATH")/collection.conf"
@@ -85,7 +94,7 @@ if [ "$HAS_INVASIVE" = true ] && [ "$NEEDS_SETUP" = true ]; then
         --output-dir "$DATA_DIR" \
         --status-file "$FLAGS_DIR/${CLUSTER_ID}_pgsnapper_status.json" \
         --setup-only \
-        $SKIP_FLAG
+        $SKIP_FLAG $NO_REDACT
     else
       echo "⚠️  Skipping $FLAG_FILE — missing DB_HOST, DB_USER, or DB_SECRET_ARN"
     fi
@@ -102,7 +111,7 @@ elif [ "$HAS_INVASIVE" = true ]; then
 
   # Step 1: Non-invasive for ALL DBs (fleet)
   echo "🔍 Discovering PostgreSQL fleet and collecting non-invasive data..."
-  python3.11 "$SCRIPTS_DIR/non_invasive_collector.py" --fleet --region "$REGION" --output-dir "$DATA_DIR"
+  python3.11 "$SCRIPTS_DIR/non_invasive_collector.py" --fleet --region "$REGION" --output-dir "$DATA_DIR" $NO_REDACT
 
   # Step 2: Invasive for flagged DBs (skip internal non-invasive — already done above)
   echo "📊 Running invasive data collection..."
@@ -125,7 +134,7 @@ elif [ "$HAS_INVASIVE" = true ]; then
         --output-dir "$DATA_DIR" \
         --status-file "$FLAGS_DIR/${CLUSTER_ID}_pgsnapper_status.json" \
         --skip-non-invasive \
-        $SKIP_FLAG
+        $SKIP_FLAG $NO_REDACT
     else
       echo "⚠️  Skipping $FLAG_FILE — missing DB_HOST, DB_USER, or DB_SECRET_ARN"
     fi
@@ -134,7 +143,7 @@ elif [ "$HAS_INVASIVE" = true ]; then
 else
   # ── No invasive flags: non-invasive only ──
   echo "🔍 Discovering PostgreSQL fleet..."
-  python3.11 "$SCRIPTS_DIR/non_invasive_collector.py" --fleet --region "$REGION" --output-dir "$DATA_DIR"
+  python3.11 "$SCRIPTS_DIR/non_invasive_collector.py" --fleet --region "$REGION" --output-dir "$DATA_DIR" $NO_REDACT
 fi
 
 # ── Package and upload ──

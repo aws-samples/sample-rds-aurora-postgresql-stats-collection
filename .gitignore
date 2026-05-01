@@ -13,6 +13,9 @@ data/
 *.json
 !cfn/*.yaml
 
+# Generated zip
+*.zip
+
 # OS
 .DS_Store
 Thumbs.db
