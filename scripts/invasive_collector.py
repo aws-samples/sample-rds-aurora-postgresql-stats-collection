@@ -977,7 +977,7 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
                     # Skip queries that need pg_stat_statements if skipped or no data
                     if analysis_name in requires_statements and (skip_pg_stat_statements or stmt_count == 0):
                         self.logger.warning(f"Skipping {analysis_name} - no pg_stat_statements data available")
-                        analysis_results[analysis_name] = []
+                        analysis_results[analysis_name] = {'columns': columns, 'data': []}
                         continue
                     # Check fixed SQL directory first for queries that need fixes
                     if sql_file.endswith('_fixed.sql'):
@@ -1005,7 +1005,12 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
                             for line in result.stdout.strip().split('\n'):
                                 if line:
                                     rows.append(line.split('|'))
-                            analysis_results[analysis_name] = rows
+                            # Store with column metadata so downstream consumers
+                            # don't need a hardcoded column mapping
+                            analysis_results[analysis_name] = {
+                                'columns': columns,
+                                'data': rows
+                            }
                             self.logger.info(f"Collected {len(rows)} rows for {analysis_name}")
                         else:
                             error_msg = result.stderr if result.stderr else 'Query returned no data'
@@ -1013,14 +1018,14 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
                                 self.logger.warning(f"Skipping {analysis_name} - incompatible with PostgreSQL version: {error_msg.split('ERROR:')[1].strip() if 'ERROR:' in error_msg else error_msg}")
                             else:
                                 self.logger.error(f"Error running {analysis_name}: {error_msg}")
-                            analysis_results[analysis_name] = []
+                            analysis_results[analysis_name] = {'columns': columns, 'data': []}
                     else:
                         self.logger.warning(f"SQL file not found: {sql_path}")
-                        analysis_results[analysis_name] = []
+                        analysis_results[analysis_name] = {'columns': columns, 'data': []}
                         
                 except Exception as e:
                     self.logger.error(f"Error running {analysis_name}: {e}")
-                    analysis_results[analysis_name] = {'error': str(e)}
+                    analysis_results[analysis_name] = {'columns': query_info.get('columns', []), 'data': [], 'error': str(e)}
             
             return {
                 'collection_timestamp': datetime.utcnow().isoformat(),
