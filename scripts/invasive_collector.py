@@ -451,6 +451,196 @@ class InvasiveCollector(NonInvasiveCollector):
             self.logger.error(f"Error collecting query performance data: {e}")
             return {'error': str(e)}
 
+    def collect_pg_health_insights(self) -> Dict[str, Any]:
+        """Collect comprehensive PostgreSQL health insights across 9 sections.
+        
+        Uses validated SQL queries from pg_health_queries.py. Version-aware branching
+        for PG17+ checkpoint stats and pg_stat_statements column differences.
+        """
+        try:
+            from scripts.pg_health_queries import (
+                OVERVIEW_SERVER_INFO, OVERVIEW_EXTENSION_INVENTORY,
+                CONFIG_PARAMETER_HEALTH, CONFIG_USER_ROLES, CONFIG_PRIVILEGE_AUDIT,
+                CONFIG_SSL_CONNECTIONS, CONFIG_PASSWORD_SECURITY, CONFIG_SENSITIVE_COLUMNS,
+                CONFIG_RLS_STATUS, CONFIG_AUDIT_CONFIG, CONFIG_DB_ROLE_OVERRIDES,
+                ACTIVITY_CONNECTION_SUMMARY, ACTIVITY_POOLING_DETECTION,
+                ACTIVITY_APP_IDENTIFICATION, ACTIVITY_WORKLOAD_CHARACTERIZATION,
+                ACTIVITY_CLIENT_ANALYSIS, ACTIVITY_CONNECTION_CHURN,
+                REPLICATION_INFO, REPLICATION_LAG, REPLICATION_SYNC_CONFIG,
+                REPLICATION_LOGICAL_SLOTS,
+                DATA_DATABASE_SIZES, DATA_WAL_DIRECTORY,
+                PERF_CHECKPOINT_STATS_PG17, PERF_CHECKPOINT_STATS_PRE17,
+                PERF_BGWRITER_STATS, PERF_AUTOVACUUM_UTILIZATION,
+                PERF_POOLING_EFFICIENCY, PERF_BUFFER_HIT_RATIOS, PERF_LOCK_TREE,
+                PERF_IO_STATS, PERF_TRANSACTION_STATS, PERF_FUNCTION_PERFORMANCE,
+                PERF_WAIT_EVENT_ANALYSIS, PERF_SESSION_DURATION,
+                PERF_PREPARED_STATEMENTS, PERF_TEMP_FILE_QUERIES,
+                PERF_QUERY_ANALYSIS_PG17, PERF_QUERY_ANALYSIS_PRE17,
+                MAINT_DATABASE_INTEGRITY, MAINT_SEQUENCE_EXHAUSTION,
+                MAINT_CONSTRAINT_VALIDATION, MAINT_MATERIALIZED_VIEWS,
+                MAINT_TABLE_VACUUM_STATS,
+                OPT_INDEX_STATISTICS, OPT_TOAST_TABLES, OPT_LARGE_TABLE_PARTITIONING,
+                OPT_UNUSED_INDEXES, OPT_DUPLICATE_INDEXES, OPT_IDLE_CONNECTIONS,
+                OPT_OVERSIZED_DATA_TYPES, OPT_UNUSED_TABLES, OPT_FK_WITHOUT_INDEXES,
+                OPT_TRIGGER_ANALYSIS, OPT_SEQ_SCAN_CANDIDATES,
+                SUMMARY_CORE_HEALTH, SUMMARY_CRITICAL_SYSTEM,
+            )
+        except ImportError:
+            # Fallback: try relative import
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "pg_health_queries",
+                os.path.join(os.path.dirname(__file__), "pg_health_queries.py")
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            # Pull all constants from the module
+            for name in dir(mod):
+                if name.isupper():
+                    locals()[name] = getattr(mod, name)
+
+        self.logger.info("Collecting PostgreSQL health insights (9 sections)")
+        
+        conn = self._get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # Detect version and extensions once
+        cursor.execute("SELECT current_setting('server_version_num')::int AS ver")
+        pg_version = cursor.fetchone()['ver']
+        
+        cursor.execute("SELECT extname FROM pg_extension")
+        extensions = {row['extname'] for row in cursor.fetchall()}
+        has_pg_stat_statements = 'pg_stat_statements' in extensions
+        
+        # Detect deployment type from the database_type already determined by _detect_db_type() via RDS API
+        # Falls back to hostname heuristic if not available in the collected data
+        deployment_type = 'Aurora' if getattr(self, '_detected_db_type', '') == 'aurora_cluster' or '.cluster-' in self.db_host else 'RDS'
+        
+        def _run(sql, **kwargs):
+            """Execute query safely, return list of dicts or [] on error."""
+            try:
+                formatted = sql.format(**kwargs) if kwargs else sql
+                cursor.execute(formatted)
+                return [dict(row) for row in cursor.fetchall()]
+            except Exception as e:
+                self.logger.warning(f"pg_health query failed: {e}")
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                return []
+        
+        result = {
+            'collection_timestamp': datetime.utcnow().isoformat(),
+            'pg_version': pg_version,
+            'deployment_type': deployment_type,
+            'has_pg_stat_statements': has_pg_stat_statements,
+        }
+        
+        # Section 1: Overview
+        result['overview'] = {
+            'server_info': _run(OVERVIEW_SERVER_INFO),
+            'extension_inventory': _run(OVERVIEW_EXTENSION_INVENTORY),
+        }
+        
+        # Section 2: Configuration
+        result['configuration'] = {
+            'parameter_health': _run(CONFIG_PARAMETER_HEALTH, deployment_type=deployment_type),
+            'user_roles': _run(CONFIG_USER_ROLES),
+            'privilege_audit': _run(CONFIG_PRIVILEGE_AUDIT),
+            'ssl_connections': _run(CONFIG_SSL_CONNECTIONS),
+            'password_security': _run(CONFIG_PASSWORD_SECURITY),
+            'sensitive_columns': _run(CONFIG_SENSITIVE_COLUMNS),
+            'rls_status': _run(CONFIG_RLS_STATUS),
+            'audit_config': _run(CONFIG_AUDIT_CONFIG),
+            'db_role_overrides': _run(CONFIG_DB_ROLE_OVERRIDES),
+        }
+        
+        # Section 3: Activity
+        result['activity'] = {
+            'connection_summary': _run(ACTIVITY_CONNECTION_SUMMARY),
+            'pooling_detection': _run(ACTIVITY_POOLING_DETECTION),
+            'app_identification': _run(ACTIVITY_APP_IDENTIFICATION),
+            'workload_characterization': _run(ACTIVITY_WORKLOAD_CHARACTERIZATION),
+            'client_analysis': _run(ACTIVITY_CLIENT_ANALYSIS),
+            'connection_churn': _run(ACTIVITY_CONNECTION_CHURN),
+        }
+        
+        # Section 4: Replication
+        result['replication'] = {
+            'replication_info': _run(REPLICATION_INFO, deployment_type=deployment_type),
+            'replication_lag': _run(REPLICATION_LAG),
+            'sync_replication_config': _run(REPLICATION_SYNC_CONFIG),
+            'logical_replication_slots': _run(REPLICATION_LOGICAL_SLOTS),
+        }
+        
+        # Section 5: Data Footprint
+        result['data_footprint'] = {
+            'database_sizes': _run(DATA_DATABASE_SIZES),
+            'wal_directory': _run(DATA_WAL_DIRECTORY),
+        }
+        
+        # Section 6: Performance (version-aware + extension-aware)
+        checkpoint_stats = _run(PERF_CHECKPOINT_STATS_PG17) if pg_version >= 170000 else _run(PERF_CHECKPOINT_STATS_PRE17)
+        
+        temp_file_queries = _run(PERF_TEMP_FILE_QUERIES) if has_pg_stat_statements else []
+        query_perf = _run(PERF_QUERY_ANALYSIS_PG17) if (has_pg_stat_statements and pg_version >= 170000) else (
+            _run(PERF_QUERY_ANALYSIS_PRE17) if has_pg_stat_statements else []
+        )
+        
+        result['performance'] = {
+            'checkpoint_stats': checkpoint_stats,
+            'bgwriter_stats': _run(PERF_BGWRITER_STATS),
+            'autovacuum_utilization': _run(PERF_AUTOVACUUM_UTILIZATION),
+            'pooling_efficiency': _run(PERF_POOLING_EFFICIENCY),
+            'buffer_hit_ratios': _run(PERF_BUFFER_HIT_RATIOS),
+            'lock_tree': _run(PERF_LOCK_TREE),
+            'io_stats': _run(PERF_IO_STATS),
+            'transaction_stats': _run(PERF_TRANSACTION_STATS),
+            'function_performance': _run(PERF_FUNCTION_PERFORMANCE),
+            'wait_event_analysis': _run(PERF_WAIT_EVENT_ANALYSIS),
+            'session_duration_analysis': _run(PERF_SESSION_DURATION),
+            'prepared_statements': _run(PERF_PREPARED_STATEMENTS),
+            'temp_file_heavy_queries': temp_file_queries,
+            'query_performance_analysis': query_perf,
+        }
+        
+        # Section 7: Maintenance
+        result['maintenance'] = {
+            'database_integrity': _run(MAINT_DATABASE_INTEGRITY),
+            'sequence_exhaustion': _run(MAINT_SEQUENCE_EXHAUSTION),
+            'constraint_validation': _run(MAINT_CONSTRAINT_VALIDATION),
+            'materialized_view_freshness': _run(MAINT_MATERIALIZED_VIEWS),
+            'table_vacuum_stats': _run(MAINT_TABLE_VACUUM_STATS),
+        }
+        
+        # Section 8: Optimization
+        result['optimization'] = {
+            'index_statistics': _run(OPT_INDEX_STATISTICS),
+            'toast_tables': _run(OPT_TOAST_TABLES),
+            'large_table_partitioning': _run(OPT_LARGE_TABLE_PARTITIONING),
+            'unused_indexes': _run(OPT_UNUSED_INDEXES),
+            'duplicate_indexes': _run(OPT_DUPLICATE_INDEXES),
+            'idle_connections': _run(OPT_IDLE_CONNECTIONS),
+            'oversized_data_types': _run(OPT_OVERSIZED_DATA_TYPES),
+            'unused_tables': _run(OPT_UNUSED_TABLES),
+            'foreign_keys_without_indexes': _run(OPT_FK_WITHOUT_INDEXES),
+            'trigger_analysis': _run(OPT_TRIGGER_ANALYSIS),
+            'seq_scan_candidates': _run(OPT_SEQ_SCAN_CANDIDATES),
+        }
+        
+        # Section 9: Summary
+        result['summary'] = {
+            'core_health_metrics': _run(SUMMARY_CORE_HEALTH),
+            'critical_system_metrics': _run(SUMMARY_CRITICAL_SYSTEM),
+        }
+        
+        cursor.close()
+        conn.close()
+        
+        self.logger.info(f"PostgreSQL health insights collected: {sum(len(v) if isinstance(v, list) else len(v) for v in result.values() if isinstance(v, (list, dict)))} data points across 9 sections")
+        return result
+
     def check_pgsnapper_prerequisites(self) -> Dict[str, Any]:
         """Check PGSnapper prerequisites on remote database."""
         try:
@@ -957,14 +1147,56 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
                 'top_tables_by_dmls': {
                     'sql_file': 'top_20_tables_by_dmls.sql',
                     'columns': ['schemaname', 'tablename', 'n_tup_ins', 'n_tup_upd', 'n_tup_del', 'n_tup_hot_upd']
-                }
+                },
+                # --- Trend queries (per-snapshot, in pgsnapper_sql_fixes/) ---
+                'db_stats_trend': {
+                    'sql_file': 'db_stats_trend.sql',
+                    'columns': ['snap_id', 'sample_start_time', 'datname', 'numbackends', 'delta_commits', 'delta_rollbacks', 'delta_blks_read', 'delta_blks_hit', 'delta_inserts', 'delta_updates', 'delta_deletes', 'delta_temp_files', 'delta_deadlocks']
+                },
+                'table_dml_trend': {
+                    'sql_file': 'table_dml_trend.sql',
+                    'columns': ['snap_id', 'sample_start_time', 'schemaname', 'relname', 'delta_ins', 'delta_upd', 'delta_del', 'delta_hot_upd', 'n_live_tup', 'n_dead_tup']
+                },
+                'seq_scan_trend': {
+                    'sql_file': 'seq_scan_trend.sql',
+                    'columns': ['snap_id', 'sample_start_time', 'schemaname', 'relname', 'delta_seq_scan', 'delta_seq_tup_read', 'delta_idx_scan', 'n_live_tup', 'n_dead_tup']
+                },
+                # --- Additional PGSnapper queries (from PGSnapper SQLs/ directory) ---
+                'top_sqls_by_cpu': {
+                    'sql_file': 'top_10_sqls_by_cpu_by_snap_id_v2.sql',
+                    'columns': ['snap_id', 'sample_start_time', 'dbid', 'userid', 'queryid', 'cpu_time', 'calls', 'avg_cpu_per_call']
+                },
+                'aging_tables_for_vacuum': {
+                    'sql_file': 'aging_tables_for_vacuum.sql',
+                    'columns': ['schemaname', 'relname', 'n_dead_tup', 'last_autovacuum', 'age_since_vacuum']
+                },
+                'needed_indexes': {
+                    'sql_file': 'needed_indexes.sql',
+                    'columns': ['schemaname', 'relname', 'seq_scan', 'seq_tup_read', 'idx_scan', 'too_much_seq', 'missing_index']
+                },
+                'checkpoint_stats_trend': {
+                    'sql_file': 'checkpoint_stats_by_snap_id_fixed.sql' if use_fixed_queries else 'checkpoint_stats_by_snap_id.sql',
+                    'columns': ['snap_id', 'sample_start_time', 'delta_buffers_bgwriter', 'delta_maxwritten_clean', 'delta_new_buffers_alloc'] if use_fixed_queries else ['snap_id', 'sample_start_time', 'delta_checkpoints_timed', 'delta_checkpoints_req', 'delta_buffers_checkpoint', 'delta_buffers_bgwriter', 'delta_buffers_backend', 'delta_new_buffers_alloc']
+                },
+                'temp_file_trend': {
+                    'sql_file': 'temp_file_by_snap_id.sql',
+                    'columns': ['snap_id', 'sample_start_time', 'temp_files', 'temp_bytes']
+                },
+                'blockers_and_waiters': {
+                    'sql_file': 'blockers_and_waiters_hist.sql',
+                    'columns': ['snap_id', 'sample_start_time', 'blocked_pid', 'blocking_pid', 'blocked_query', 'blocking_query', 'wait_duration']
+                },
+                'top_functions': {
+                    'sql_file': 'top_20_functions_by_avg_total_time.sql',
+                    'columns': ['schemaname', 'funcname', 'calls', 'total_time', 'self_time', 'avg_time']
+                },
             }
             
             if use_fixed_queries:
                 self.logger.info("Using fixed SQL queries for newer PostgreSQL version (shared_blk_read_time columns)")
             
             # Queries that require pg_stat_statements data
-            requires_statements = {'top_sqls_by_time', 'top_sqls_by_calls'}
+            requires_statements = {'top_sqls_by_time', 'top_sqls_by_calls', 'top_sqls_by_cpu'}
 
             for analysis_name, query_info in key_queries.items():
                 try:
@@ -977,7 +1209,7 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
                         analysis_results[analysis_name] = {'columns': columns, 'data': []}
                         continue
                     # Check fixed SQL directory first for queries that need fixes
-                    if sql_file.endswith('_fixed.sql'):
+                    if sql_file.endswith('_fixed.sql') or sql_file.endswith('_trend.sql'):
                         sql_path = os.path.join(fixed_sql_dir, sql_file)
                     else:
                         sql_path = os.path.join(sql_dir, sql_file)
@@ -1183,6 +1415,7 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
         
         # Detect database type dynamically
         db_type_info = self._detect_db_type(cluster_id)
+        self._detected_db_type = db_type_info['type']
         self.logger.info(f"Detected {db_type_info['type']} for identifier: {cluster_id}")
         
         # ── Run 1: Setup only — install pgsnapper cron, no data collection ──
@@ -1264,6 +1497,13 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
             collected_data['configuration_parameters'] = self.collect_configuration_parameters()
             collected_data['schema_information'] = self.collect_schema_information()
             collected_data['query_performance'] = self.collect_query_performance()
+            
+            # Collect comprehensive health insights (57 queries across 9 sections)
+            try:
+                collected_data['pg_health_insights'] = self.collect_pg_health_insights()
+            except Exception as e:
+                self.logger.warning(f"pg_health_insights collection failed (non-fatal): {e}")
+                collected_data['pg_health_insights'] = {'error': str(e)}
             
             # Collect PGSnapper data if requested
             if pgsnapper_min_days > 0:
