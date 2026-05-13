@@ -25,6 +25,27 @@ PGSNAPPER_MIN_DAYS="${6:-1}"
 PGSNAPPER_INTERVAL="${7:-60}"
 SKIP_PG_STAT_STATEMENTS="${8:-false}"
 
+# Verify network connectivity to the database endpoint before writing the flag
+echo "Checking connectivity to $DB_HOST:5432..."
+if command -v pg_isready &>/dev/null; then
+    if ! pg_isready -h "$DB_HOST" -p 5432 -t 5 &>/dev/null; then
+        echo "WARNING: Cannot reach $DB_HOST:5432 from this instance."
+        echo "   Possible causes:"
+        echo "   - Security group does not allow outbound TCP/5432 from this EC2"
+        echo "   - DB security group does not allow inbound from this EC2"
+        echo "   - Network ACL blocking traffic"
+        echo "   - VPC peering / routing not configured"
+        echo ""
+        echo "   The flag file will still be created, but collect-and-share.sh will fail"
+        echo "   until connectivity is resolved."
+        echo ""
+    else
+        echo "OK - database endpoint is reachable."
+    fi
+else
+    echo "INFO: pg_isready not found, skipping connectivity check."
+fi
+
 # Load config for DATA_DIR
 REAL_SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 CONFIG_FILE="$(dirname "$REAL_SCRIPT_PATH")/collection.conf"

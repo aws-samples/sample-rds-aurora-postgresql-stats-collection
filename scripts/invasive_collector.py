@@ -517,11 +517,21 @@ class InvasiveCollector(NonInvasiveCollector):
                     "in the RDS/Aurora parameter group, then reboot the DB instance."
                 )
             if not ext_installed:
-                missing.append(
-                    "[Required for deep dive] pg_stat_statements extension not installed: "
-                    "After setting shared_preload_libraries and rebooting, run: "
-                    f"CREATE EXTENSION pg_stat_statements; on database '{self.db_name}'."
-                )
+                if preload_ok:
+                    # Library is loaded but extension not created — no reboot needed
+                    missing.append(
+                        "[Required for deep dive] pg_stat_statements extension not installed: "
+                        "The library is already loaded (shared_preload_libraries is set). "
+                        f"Run: CREATE EXTENSION IF NOT EXISTS pg_stat_statements; on database '{self.db_name}'. "
+                        "No reboot required."
+                    )
+                else:
+                    # Library not loaded — need both steps
+                    missing.append(
+                        "[Required for deep dive] pg_stat_statements extension not installed: "
+                        "After adding to shared_preload_libraries and rebooting, run: "
+                        f"CREATE EXTENSION IF NOT EXISTS pg_stat_statements; on database '{self.db_name}'."
+                    )
             if not track_functions_ok:
                 missing.append(
                     f"[Optional] track_functions is '{track_functions}', recommend 'all' to track procedural-language, SQL and C language functions: "
@@ -844,8 +854,8 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
         try:
             self.logger.info("Running PGSnapper analysis queries")
             
-            # Get snapshot IDs based on the time window (current time - min_days)
-            # This ensures we analyze only the data from the current collection period
+            # Use ALL available snapshots — the readiness gate (check_pgsnapper_data_age)
+            # already ensures we have enough data. No time-based filtering here.
             self._validate_identifier(analysis_db, 'analysis_db')
             if not isinstance(min_days, (int, float)) or min_days < 0:
                 raise ValueError(f"Invalid min_days value: {min_days}")
@@ -853,10 +863,10 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
                 'sudo', '-u', 'postgres', 'psql',
                 '-d', analysis_db,
                 '-t', '-A',
-                '-c', f"SELECT MIN(snap_id), MAX(snap_id) FROM pg_awr_snapshots_cust WHERE sample_start_time >= NOW() - INTERVAL '{int(min_days)} days';"  # nosec B608 - min_days cast to int above, not user-controlled string
+                '-c', 'SELECT MIN(snap_id), MAX(snap_id) FROM pg_awr_snapshots_cust;'
             ]
 
-            result = subprocess.run(get_snap_ids_cmd, capture_output=True, text=True, timeout=30, cwd='/tmp')  # nosec B603 B108 - analysis_db validated; min_days cast to int; cwd=/tmp is working dir only, no temp files created  # nosemgrep: dangerous-subprocess-use-audit
+            result = subprocess.run(get_snap_ids_cmd, capture_output=True, text=True, timeout=30, cwd='/tmp')  # nosec B603 B108 - analysis_db validated; cwd=/tmp is working dir only  # nosemgrep: dangerous-subprocess-use-audit
             if result.returncode != 0 or not result.stdout.strip():
                 self.logger.error("Failed to get snapshot IDs")
                 return {'error': 'No snapshots found'}
@@ -865,21 +875,8 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
             begin_snap_id = snap_ids[0]
             end_snap_id = snap_ids[1]
             
-            # If no snapshots in the time window, use all available snapshots
             if not begin_snap_id or not end_snap_id:
-                self.logger.info(f"No snapshots found in last {min_days} days, using all available snapshots")
-                get_all_snaps_cmd = [
-                    'sudo', '-u', 'postgres', 'psql',
-                    '-d', analysis_db,
-                    '-t', '-A',
-                    '-c', 'SELECT MIN(snap_id), MAX(snap_id) FROM pg_awr_snapshots_cust;'
-                ]
-                result = subprocess.run(get_all_snaps_cmd, capture_output=True, text=True, timeout=30, cwd='/tmp')  # nosec B603 B108 - cwd=/tmp is working dir only  # nosemgrep: dangerous-subprocess-use-audit
-                if result.returncode != 0 or not result.stdout.strip():
-                    return {'error': 'No snapshots found'}
-                snap_ids = result.stdout.strip().split('|')
-                begin_snap_id = snap_ids[0]
-                end_snap_id = snap_ids[1]
+                return {'error': 'No snapshots found in analysis database'}
             
             self.logger.info(f"Using snapshot range: {begin_snap_id} to {end_snap_id}")
             
@@ -1086,50 +1083,25 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
             
             if not data_status['ready']:
                 remaining_seconds = (min_days - data_status.get('days', 0)) * 86400
+                remaining_msg = self._format_remaining_time(remaining_seconds / 86400)
                 
-                # If remaining wait is short (under 30 minutes), wait and retry
-                if remaining_seconds <= 1800:
-                    # Minimum 60s wait (one snapshot interval) even if math says 0
-                    wait_seconds = max(remaining_seconds + 30, 60)
-                    wait_minutes = int(wait_seconds / 60) + 1
-                    self.logger.info(f"PGSnapper data not ready — waiting {wait_minutes} minute(s) for snapshots to accumulate...")
-                    
-                    # Ensure cron is running
-                    try:
-                        self.setup_pgsnapper_cron(snap_interval_minutes)
-                    except Exception:
-                        pass  # Cron may already be installed
-                    
-                    import time as _time
-                    _time.sleep(wait_seconds)
-                    
-                    # Re-check
-                    data_status = self.check_pgsnapper_data_age(output_dir, min_days)
-                    if status_file:
-                        status_data['status'] = 'analyzed' if data_status.get('ready') else 'collecting'
-                        status_data['pgsnapper_days_collected'] = data_status.get('days', 0)
-                        status_data['pgsnapper_snapshots'] = data_status.get('snapshots', 0)
-                        status_data['pgsnapper_ready'] = data_status.get('ready', False)
-                        with open(status_file, 'w', encoding='utf-8') as f:
-                            json.dump(status_data, f, indent=2)
+                # Ensure cron is running so snapshots keep accumulating
+                try:
+                    self.setup_pgsnapper_cron(snap_interval_minutes)
+                except Exception:
+                    pass  # Cron may already be installed
                 
-                if not data_status['ready']:
-                    self.logger.info(f"PGSnapper data not ready: {data_status.get('message')}")
-                    
-                    try:
-                        self.setup_pgsnapper_cron(snap_interval_minutes)
-                        cron_status = 'configured'
-                        cron_message = f"PGSnapper cron job configured to collect snapshots every {snap_interval_minutes} minutes."
-                    except Exception as cron_error:
-                        self.logger.error(f"Failed to setup PGSnapper cron: {cron_error}")
-                        cron_status = 'failed'
-                        cron_message = f"Failed to setup cron job: {cron_error}. Please install cronie: sudo dnf install -y cronie && sudo systemctl start crond"
-                    
-                    return {
-                        'status': 'collecting',
-                    'cron_status': cron_status,
-                    'message': cron_message,
-                    'next_steps': f"Wait {min_days} days for data collection, then run this command again to analyze the collected data.",
+                self.logger.info(
+                    f"PGSnapper data not ready: {data_status.get('snapshots', 0)} snapshots collected, "
+                    f"need ~{remaining_msg} more. Re-run this command later."
+                )
+                
+                return {
+                    'status': 'collecting',
+                    'cron_status': 'configured',
+                    'message': f"PGSnapper cron job running (every {snap_interval_minutes} min). "
+                               f"{data_status.get('snapshots', 0)} snapshots so far, need ~{remaining_msg} more.",
+                    'next_steps': f"Re-run this command after ~{remaining_msg} to analyze the collected data.",
                     'data_status': data_status,
                     'output_dir': output_dir
                 }

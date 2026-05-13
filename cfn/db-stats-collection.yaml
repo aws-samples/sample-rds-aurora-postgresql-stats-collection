@@ -64,10 +64,17 @@ Parameters:
     Description: S3 key for application code zip file
     Default: 'wal-db-stats-collection.zip'
 
+  AssignPublicIP:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Assign a public IP to the EC2 instance. Set to false for private subnet + SSM access (recommended).
+
 Conditions:
   HasSADataBucket: !Not [!Equals [!Ref SADataBucket, '']]
   NeedToCreateBucket: !Equals [!Ref SADataBucket, '']
   HasCodeSourceBucket: !Not [!Equals [!Ref CodeSourceBucket, '']]
+  IsPublicIP: !Equals [!Ref AssignPublicIP, 'true']
 
 Resources:
   # S3 Bucket for data sharing with SA
@@ -253,11 +260,14 @@ Resources:
       GroupDescription: Security group for Customer Data Collection EC2 instance
       VpcId: !Ref VpcId
       SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: !Ref AllowedCIDR
-          Description: SSH access
+        - !If
+          - IsPublicIP
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: !Ref AllowedCIDR
+            Description: SSH access
+          - !Ref 'AWS::NoValue'
       SecurityGroupEgress:
         - IpProtocol: tcp
           FromPort: 443
@@ -286,7 +296,7 @@ Resources:
           SubnetId: !Ref SubnetId
           GroupSet:
             - !Ref CustomerDataCollectionSecurityGroup
-          AssociatePublicIpAddress: true
+          AssociatePublicIpAddress: !If [IsPublicIP, true, false]
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:
@@ -321,25 +331,25 @@ Resources:
           cd /home/ec2-user/wal-db-stats-collection
           
           # Try git clone first, fallback to S3
-          echo "📥 Attempting to clone repository..."
+          echo "[INFO] Attempting to clone repository..."
           if sudo -u ec2-user git clone https://github.com/aws-samples/sample-rds-aurora-postgresql-stats-collection.git . 2>/dev/null; then
-            echo "✅ Code cloned from GitHub"
+            echo "[OK] Code cloned from GitHub"
           elif [ ! -z "${CodeSourceBucket}" ]; then
-            echo "📥 Git clone failed, downloading from S3..."
+            echo "[INFO] Git clone failed, downloading from S3..."
             aws s3 cp "s3://${CodeSourceBucket}/${CodeSourceKey}" /tmp/wal-db-stats-collection.zip || {
-              echo "❌ Both git clone and S3 download failed - deployment cannot continue"
+              echo "[ERROR] Both git clone and S3 download failed - deployment cannot continue"
               /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
               exit 1
             }
             sudo -u ec2-user unzip -o -q /tmp/wal-db-stats-collection.zip -d . || {
-              echo "❌ Code extraction failed - deployment cannot continue"
+              echo "[ERROR] Code extraction failed - deployment cannot continue"
               /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
               exit 1
             }
             rm /tmp/wal-db-stats-collection.zip
-            echo "✅ Code downloaded from S3"
+            echo "[OK] Code downloaded from S3"
           else
-            echo "❌ Both git clone and S3 download failed - no code source available"
+            echo "[ERROR] Both git clone and S3 download failed - no code source available"
             /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
             exit 1
           fi
@@ -350,7 +360,7 @@ Resources:
             [ ! -f "$f" ] && MISSING="$MISSING $f"
           done
           if [ -n "$MISSING" ]; then
-            echo "❌ Deployment package incomplete — missing:$MISSING"
+            echo "[ERROR] Deployment package incomplete — missing:$MISSING"
             /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
             exit 1
           fi
@@ -358,13 +368,13 @@ Resources:
           # Install Python packages for python3.11 (application code)
           python3.11 -m pip install --upgrade pip
           python3.11 -m pip install -r requirements.txt || {
-            echo "❌ Requirements installation failed - deployment cannot continue"
+            echo "[ERROR] Requirements installation failed - deployment cannot continue"
             /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
             exit 1
           }
           
           # Setup local PostgreSQL for PGPerfStatsSnapper
-          echo "🐘 Setting up PostgreSQL..."
+          echo "[INFO] Setting up PostgreSQL..."
           
           # Initialize PostgreSQL database
           postgresql-setup --initdb
@@ -535,8 +545,11 @@ Outputs:
       Name: !Sub '${AWS::StackName}-CustomerDataBucket'
   
   SSHCommand:
-    Description: SSH command to connect to the instance
-    Value: !Sub 'ssh -i ${KeyPairName}.pem ec2-user@${CustomerDataCollectionInstance.PublicIp}'
+    Description: Command to connect to the instance
+    Value: !If
+      - IsPublicIP
+      - !Sub 'ssh -i ${KeyPairName}.pem ec2-user@${CustomerDataCollectionInstance.PublicIp}'
+      - !Sub 'aws ssm start-session --target ${CustomerDataCollectionInstance} --region ${AWS::Region}'
   
   DataCollectionCommand:
     Description: Command to run data collection and sharing

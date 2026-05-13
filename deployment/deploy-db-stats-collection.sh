@@ -49,6 +49,10 @@ while [[ $# -gt 0 ]]; do
             DB_PORT="$2"
             shift 2
             ;;
+        --no-public-ip)
+            ASSIGN_PUBLIC_IP="false"
+            shift
+            ;;
         --sa-data-bucket)
             SA_DATA_BUCKET="$2"
             shift 2
@@ -72,7 +76,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --vpc-id VPC_ID                 VPC ID (required)"
             echo "  --subnet-id SUBNET_ID           Subnet ID (public subnet recommended)"
             echo "  --instance-type TYPE            Instance type (default: t3.medium)"
-            echo "  --allowed-cidr CIDR             Allowed CIDR for SSH (required; e.g. \$(curl -s ifconfig.me)/32 — 0.0.0.0/0 is rejected)
+            echo "  --allowed-cidr CIDR             Allowed CIDR for SSH (required when using public IP; e.g. \$(curl -s ifconfig.me)/32 — 0.0.0.0/0 is rejected)
+  --no-public-ip                    Deploy without public IP (private subnet + SSM access; --allowed-cidr not required)
   --db-port PORT                  PostgreSQL port on target RDS/Aurora endpoint for invasive collection (default: 5432)"
             echo "  --sa-data-bucket BUCKET         S3 bucket name for SA data sharing (optional)"
             echo "  --enable-scheduled true/false   Enable scheduled data collection (default: true)"
@@ -120,9 +125,16 @@ if [[ -z "$SUBNET_ID" ]]; then
 fi
 
 if [[ -z "$ALLOWED_CIDR" ]]; then
-    echo "❌ Error: --allowed-cidr is required"
-    echo "   Specify your IP in CIDR notation, e.g. --allowed-cidr \$(curl -s ifconfig.me)/32"
-    exit 1
+    # CIDR is only required when assigning a public IP (SSH access)
+    if [[ "${ASSIGN_PUBLIC_IP:-true}" == "true" ]]; then
+        echo "Error: --allowed-cidr is required when using a public IP"
+        echo "   Specify your IP in CIDR notation, e.g. --allowed-cidr \$(curl -s ifconfig.me)/32"
+        echo "   Or use --no-public-ip for private subnet + SSM access (no SSH needed)"
+        exit 1
+    else
+        # No public IP — use a placeholder that creates no ingress rule
+        ALLOWED_CIDR="127.0.0.1/32"
+    fi
 fi
 
 if [[ "$ALLOWED_CIDR" == "0.0.0.0/0" ]]; then
@@ -183,15 +195,18 @@ echo "📦 Uploading code to S3..."
 aws s3 mb "s3://$CODE_BUCKET" --region "$REGION" 2>/dev/null || true
 aws s3 cp "$ZIP_PATH" "s3://$CODE_BUCKET/$CODE_KEY" --region "$REGION"
 
-# If customer data bucket already exists, pass it explicitly to prevent CFN from trying to create it
+# Determine the data bucket name.
+# IMPORTANT: On stack updates, do NOT set SADataBucket if the bucket is owned by this stack
+# (created via the NeedToCreateBucket condition). Setting it would flip the condition to false
+# and cause CFN to DELETE the stack-owned bucket — losing all collected data.
 CUSTOMER_DATA_BUCKET_NAME="${STACK_NAME}-${ACCOUNT_ID}"
 if [ -n "$SA_DATA_BUCKET" ]; then
+    # User explicitly provided an external bucket — use it
     RESOLVED_DATA_BUCKET="$SA_DATA_BUCKET"
-elif aws s3api head-bucket --bucket "$CUSTOMER_DATA_BUCKET_NAME" --region "$REGION" 2>/dev/null; then
-    echo "ℹ️  Customer data bucket already exists, reusing: $CUSTOMER_DATA_BUCKET_NAME"
-    SA_DATA_BUCKET="$CUSTOMER_DATA_BUCKET_NAME"
-    RESOLVED_DATA_BUCKET="$CUSTOMER_DATA_BUCKET_NAME"
 else
+    # Let CFN manage the bucket (create on first deploy, keep on updates)
+    # SA_DATA_BUCKET stays empty so NeedToCreateBucket remains true
+    SA_DATA_BUCKET=""
     RESOLVED_DATA_BUCKET="$CUSTOMER_DATA_BUCKET_NAME"
 fi
 
@@ -229,6 +244,7 @@ aws cloudformation "$OPERATION" \
         "ParameterKey=SubnetId,ParameterValue=$SUBNET_ID" \
         "ParameterKey=InstanceType,ParameterValue=$INSTANCE_TYPE" \
         "ParameterKey=AllowedCIDR,ParameterValue=$ALLOWED_CIDR" \
+        "ParameterKey=AssignPublicIP,ParameterValue=${ASSIGN_PUBLIC_IP:-true}" \
         "ParameterKey=DBPort,ParameterValue=${DB_PORT:-5432}" \
         "ParameterKey=SADataBucket,ParameterValue=$SA_DATA_BUCKET" \
         "ParameterKey=ResolvedDataBucketName,ParameterValue=$RESOLVED_DATA_BUCKET" \
