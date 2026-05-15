@@ -1145,6 +1145,19 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
             analysis_db = self.load_pgsnapper_data(actual_output_dir)
             analysis_results = self.run_pgsnapper_analysis(analysis_db, min_days, skip_pg_stat_statements)
             
+            # Collection complete — remove the PGSnapper cron job to stop accumulating snapshots
+            try:
+                result = subprocess.run(['crontab', '-l'], capture_output=True, text=True, timeout=10)  # nosec B603 B607
+                if result.returncode == 0 and 'pg_perf_stat_snapper' in result.stdout:
+                    new_cron = '\n'.join(
+                        line for line in result.stdout.strip().split('\n')
+                        if 'pg_perf_stat_snapper' not in line
+                    )
+                    subprocess.run(['crontab', '-'], input=new_cron + '\n', text=True, timeout=10)  # nosec B603 B607
+                    self.logger.info("PGSnapper cron job removed (collection complete)")
+            except Exception as e:
+                self.logger.warning(f"Could not remove PGSnapper cron: {e}")
+            
             return {
                 'status': 'analyzed',
                 'pgsnapper_output_dir': actual_output_dir,
