@@ -159,6 +159,7 @@ ZIP_PATH="$REPO_ROOT/$ZIP_NAME"
         deployment/enable-invasive-collection.sh
         scripts/non_invasive_collector.py
         scripts/invasive_collector.py
+        scripts/pg_health_queries.py
         utils/fleet_discovery.py
         utils/pii_redactor.py
         requirements.txt
@@ -183,6 +184,7 @@ ZIP_PATH="$REPO_ROOT/$ZIP_NAME"
         cfn/db-stats-collection.yaml \
         scripts/non_invasive_collector.py \
         scripts/invasive_collector.py \
+        scripts/pg_health_queries.py \
         scripts/pgsnapper_sql_fixes/ \
         utils/fleet_discovery.py \
         utils/pii_redactor.py \

@@ -10,10 +10,12 @@ set -e
 
 # Parse arguments
 NO_REDACT=""
+SKIP_SECURITY=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-redact) NO_REDACT="--no-redact"; shift ;;
-    *) echo "Unknown option: $1"; echo "Usage: $0 [--no-redact]"; exit 1 ;;
+    --skip-security) SKIP_SECURITY="--skip-security"; shift ;;
+    *) echo "Unknown option: $1"; echo "Usage: $0 [--no-redact] [--skip-security]"; exit 1 ;;
   esac
 done
 
@@ -94,7 +96,7 @@ if [ "$HAS_INVASIVE" = true ] && [ "$NEEDS_SETUP" = true ]; then
         --output-dir "$DATA_DIR" \
         --status-file "$FLAGS_DIR/${CLUSTER_ID}_pgsnapper_status.json" \
         --setup-only \
-        $SKIP_FLAG $NO_REDACT
+        $SKIP_FLAG $NO_REDACT $SKIP_SECURITY
     else
       echo "⚠️  Skipping $FLAG_FILE — missing DB_HOST, DB_USER, or DB_SECRET_ARN"
     fi
@@ -134,7 +136,7 @@ elif [ "$HAS_INVASIVE" = true ]; then
         --output-dir "$DATA_DIR" \
         --status-file "$FLAGS_DIR/${CLUSTER_ID}_pgsnapper_status.json" \
         --skip-non-invasive \
-        $SKIP_FLAG $NO_REDACT
+        $SKIP_FLAG $NO_REDACT $SKIP_SECURITY
     else
       echo "⚠️  Skipping $FLAG_FILE — missing DB_HOST, DB_USER, or DB_SECRET_ARN"
     fi

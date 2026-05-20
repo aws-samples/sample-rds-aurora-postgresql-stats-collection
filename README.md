@@ -71,6 +71,7 @@ Wait ~10 minutes for the instance to finish setup after the stack completes.
 | `--vpc-id` | Yes | — | VPC ID where the EC2 instance will be deployed. **Must be the same VPC as your RDS/Aurora cluster** so the instance can reach the database endpoint. |
 | `--subnet-id` | Yes | — | Subnet ID within the VPC above. Two options: **(1) Public subnet** (with an Internet Gateway) — instance gets a public IP, SSH works directly from your machine. **(2) Private subnet with a [NAT Gateway](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html)** — SSH is not possible without a bastion or VPN. Outbound traffic routes via NAT for S3 uploads and package installation. Use [AWS Systems Manager Session Manager](#accessing-the-instance-in-a-private-subnet) to connect. |
 | `--allowed-cidr` | Yes | — | CIDR allowed for SSH inbound on port 22. **Must be your specific IP** (e.g. `203.0.113.42/32`). `0.0.0.0/0` is rejected — open SSH access is a security risk. Find your IP with `curl -s ifconfig.me`. |
+| `--no-public-ip` | No | — | Deploy without a public IP address. Use when deploying into a private subnet with a NAT Gateway. SSH is not available; connect via [AWS Systems Manager Session Manager](#accessing-the-instance-in-a-private-subnet). When set, `--allowed-cidr` is not required. |
 | `--db-port` | No | `5432` | PostgreSQL port on your RDS/Aurora endpoint. Only needed for invasive collection if your database uses a non-standard port. Drives the outbound security group egress rule. |
 | `--region` | No | `us-east-1` | AWS region to deploy into |
 | `--instance-type` | No | `t3.medium` | EC2 instance type |
@@ -146,15 +147,13 @@ Example:
   false   # set to true if pg_stat_statements is not installed
 ```
 
+With the example above (`pgsnapper-min-days=1`, `pgsnapper-interval=60`), wait at least 1 day between runs. For a quick test, use `pgsnapper-min-days=0.01` (~15 minutes) and `pgsnapper-interval=1` (1 minute interval).
+
 Database statistics and metrics collection requires **two runs** of `./collect-and-share.sh`:
 
 1. **Run 1 (setup only)** — installs the PGSnapper cron job and runs an initial snapshot to verify connectivity. **No data collection happens on this run** — no non-invasive metrics, no database statistics, no schema or query performance data. This keeps Run 1 fast and avoids collecting data that would be stale by Run 2.
 2. **Wait** — allow snapshots to accumulate for at least `pgsnapper-min-days` worth of data.
 3. **Run 2 (collect everything)** — collects **all** data with aligned timestamps: non-invasive metrics (CloudWatch, Performance Insights, configuration) for the entire fleet, plus invasive data (database statistics, schema, query performance, PGSnapper analysis) for flagged clusters. Because both non-invasive and invasive data are collected in the same run, all metrics share the same time window.
-
-> **Note**: If the initial snapshot fails during Run 1 (bad credentials, network issue, etc.), the cron job will **not** be installed. Fix the underlying issue and re-run `./collect-and-share.sh` — it will detect that setup is still needed and retry.
-
-With the example above (`pgsnapper-min-days=1`, `pgsnapper-interval=60`), wait at least 1 day between runs. For a quick test, use `pgsnapper-min-days=0.01` (~15 minutes) and `pgsnapper-interval=1` (1 minute interval).
 
 ```bash
 # Run 1 — setup only: installs cron, verifies connectivity (no data collection)
@@ -165,6 +164,14 @@ With the example above (`pgsnapper-min-days=1`, `pgsnapper-interval=60`), wait a
 # Run 2 — collects all data (non-invasive + invasive) with aligned timestamps
 ./collect-and-share.sh
 ```
+
+> **Note**: If the initial snapshot fails during Run 1 (bad credentials, network issue, etc.), the cron job will **not** be installed. Fix the underlying issue and re-run `./collect-and-share.sh` — it will detect that setup is still needed and retry.
+
+
+> **Note**: To exclude security-related queries (user roles, privileges, SSL, passwords, RLS, audit config) from the collection, pass `--skip-security` to `collect-and-share.sh`:
+> ```bash
+> ./collect-and-share.sh --skip-security
+> ```
 
 Collected data is automatically uploaded to:
 ```
@@ -190,9 +197,9 @@ rm -f data/flags/*.flag
 ./collect-and-share.sh
 ```
 
-> **Note**: Removing the flag file only prevents invasive collection from running — it does not affect any PGSnapper cron job that may have already been installed. If the cron job was set up during a previous `collect-and-share.sh` run, you can choose to remove it too if any concerns:
+> **Note**: Removing the flag file only prevents invasive collection from running — it does not affect any PGSnapper cron job that may have already been installed. However, the cron job is **automatically removed** after a successful Run 2 collection. If you need to remove it manually before that:
 > ```bash
-> crontab -l | grep -v 'pgsnapper_snap.sh' | crontab -
+> crontab -l | grep -v 'pg_perf_stat_snapper' | crontab -
 > ```
 
 ## Step 4: Share collected data with your SA
@@ -223,7 +230,8 @@ Your SA will use this data to perform Well Architected Review and provide you wi
 - `pg_stat_user_tables` — table bloat, sequential scans, DML activity
 - `pg_stat_user_indexes` — unused and duplicate indexes
 - `pg_stat_bgwriter` — checkpoint and buffer statistics
-- PGPerfStatsSnapper workload snapshots (historical query performance trends)
+- PostgreSQL health insights — comprehensive assessment across 9 areas: database overview, configuration health, connection activity, replication status, data footprint, query/IO performance, maintenance health, optimization opportunities, and security audit *(security queries can be excluded with `--skip-security`)*
+- PGPerfStatsSnapper workload snapshots (historical query performance trends, session activity, CPU-heavy queries, checkpoint/temp file trends)
 
 ## Security and privacy
 
