@@ -185,7 +185,9 @@ ZIP_PATH="$REPO_ROOT/$ZIP_NAME"
         scripts/non_invasive_collector.py \
         scripts/invasive_collector.py \
         scripts/pg_health_queries.py \
+        scripts/generate_report.py \
         scripts/pgsnapper_sql_fixes/ \
+        viewer/report-template.html \
         utils/fleet_discovery.py \
         utils/pii_redactor.py \
         requirements.txt \

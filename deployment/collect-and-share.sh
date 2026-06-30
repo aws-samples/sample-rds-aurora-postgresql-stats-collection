@@ -11,11 +11,13 @@ set -e
 # Parse arguments
 NO_REDACT=""
 SKIP_SECURITY=""
+GENERATE_REPORT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-redact) NO_REDACT="--no-redact"; shift ;;
     --skip-security) SKIP_SECURITY="--skip-security"; shift ;;
-    *) echo "Unknown option: $1"; echo "Usage: $0 [--no-redact] [--skip-security]"; exit 1 ;;
+    --generate-report) GENERATE_REPORT="true"; shift ;;
+    *) echo "Unknown option: $1"; echo "Usage: $0 [--no-redact] [--skip-security] [--generate-report]"; exit 1 ;;
   esac
 done
 
@@ -155,6 +157,20 @@ mkdir -p "$PACKAGE_DIR"
 
 cp "$DATA_DIR"/*.json "$PACKAGE_DIR/" 2>/dev/null || echo "No JSON files to copy"
 cp "$DATA_DIR"/fleet_* "$PACKAGE_DIR/" 2>/dev/null || echo "No fleet files to copy"
+
+# ── Generate HTML reports (if --generate-report flag is set) ──
+if [ "$GENERATE_REPORT" = "true" ]; then
+  REPORT_SCRIPT="$PROJECT_DIR/scripts/generate_report.py"
+  if [ -f "$REPORT_SCRIPT" ]; then
+    echo "📊 Generating interactive HTML reports..."
+    for JSON_FILE in "$PACKAGE_DIR"/*_invasive_data.json "$PACKAGE_DIR"/*_non_invasive_data.json; do
+      [ -f "$JSON_FILE" ] || continue
+      python3.11 "$REPORT_SCRIPT" "$JSON_FILE" 2>/dev/null && echo "  ✓ $(basename "${JSON_FILE%_data.json}_report.html")" || echo "  ⚠️ Failed: $(basename "$JSON_FILE")"
+    done
+  else
+    echo "⚠️ Report generator not found at $REPORT_SCRIPT — skipping HTML report generation"
+  fi
+fi
 
 cat > "$PACKAGE_DIR/collection-metadata.json" << METADATA
 {
