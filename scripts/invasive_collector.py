@@ -946,11 +946,11 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
         """Format remaining wait time in human-readable units."""
         minutes = remaining_days * 24 * 60
         if minutes < 60:
-            return f'Need {minutes:.0f} more minute(s)'
+            return f'{minutes:.0f} more minute(s)'
         hours = remaining_days * 24
         if hours < 24:
-            return f'Need {hours:.1f} more hour(s)'
-        return f'Need {remaining_days:.1f} more day(s)'
+            return f'{hours:.1f} more hour(s)'
+        return f'{remaining_days:.1f} more day(s)'
 
     def check_pgsnapper_data_age(self, output_dir: str, min_days: int = 3) -> Dict[str, Any]:
         """Check age and count of collected PGSnapper snapshots."""
@@ -1345,14 +1345,14 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
                 
                 self.logger.info(
                     f"PGSnapper data not ready: {data_status.get('snapshots', 0)} snapshots collected, "
-                    f"need ~{remaining_msg} more. Re-run this command later."
+                    f"need ~{remaining_msg}. Re-run this command later."
                 )
                 
                 return {
                     'status': 'collecting',
                     'cron_status': 'configured',
                     'message': f"PGSnapper cron job running (every {snap_interval_minutes} min). "
-                               f"{data_status.get('snapshots', 0)} snapshots so far, need ~{remaining_msg} more.",
+                               f"{data_status.get('snapshots', 0)} snapshots so far, need ~{remaining_msg}.",
                     'next_steps': f"Re-run this command after ~{remaining_msg} to analyze the collected data.",
                     'data_status': data_status,
                     'output_dir': output_dir
