@@ -176,11 +176,18 @@ Database statistics and metrics collection requires **two runs** of `./collect-a
 
 ### (Optional) Generate interactive HTML reports
 
+![DB Metrics Report Demo](demo/demo-metrics.gif)
+
 To generate self-contained HTML reports that can be opened in any browser without a server, pass `--generate-report`:
 
 ```bash
 ./collect-and-share.sh --generate-report
 ```
+
+> Flags can be combined:
+> ```bash
+> ./collect-and-share.sh --generate-report --skip-security
+> ```
 
 This produces an interactive HTML report for each collected database alongside the JSON data. The reports provide a visual DB Metrics Explorer with 7 tabs: Configuration, CloudWatch Metrics, Performance Insights, Security, Database Health, Workload Trends, and Schema Explorer.
 
@@ -194,15 +201,7 @@ s3://wal-db-stats-collection-<account-id>/db-stats/<timestamp>/
 └── ...
 ```
 
-Download and open any `*_report.html` file in your browser — no internet connection, server, or additional software required. Flags can be combined:
-```bash
-./collect-and-share.sh --generate-report --skip-security
-```
-
-Collected data is automatically uploaded to:
-```
-s3://wal-db-stats-collection-<account-id>/db-stats/<timestamp>/
-```
+Download and open any `*_report.html` file in your browser — no internet connection, server, or additional software required. 
 
 ### (Optional) Collect CloudWatch metrics only
 
