@@ -8,6 +8,7 @@ Deploys a lightweight EC2 instance in your AWS account that:
 - Discovers all PostgreSQL databases (Aurora and RDS) in your account/region
 - Collects CloudWatch metrics, Performance Insights data, and database configuration
 - Collects deeper database statistics (requires AWS Secrets Manager to access DB from your account)
+- Generates interactive HTML reports for visual exploration of collected metrics (optional)
 - Uploads collected data to an S3 bucket in your account for review
 
 ## Prerequisites
@@ -173,10 +174,34 @@ Database statistics and metrics collection requires **two runs** of `./collect-a
 > ./collect-and-share.sh --skip-security
 > ```
 
-Collected data is automatically uploaded to:
+### (Optional) Generate interactive HTML reports
+
+![DB Metrics Report Demo](demo/demo-metrics.gif)
+
+To generate self-contained HTML reports that can be opened in any browser without a server, pass `--generate-report`:
+
+```bash
+./collect-and-share.sh --generate-report
+```
+
+> Flags can be combined:
+> ```bash
+> ./collect-and-share.sh --generate-report --skip-security
+> ```
+
+This produces an interactive HTML report for each collected database alongside the JSON data. The reports provide a visual DB Metrics Explorer with 7 tabs: Configuration, CloudWatch Metrics, Performance Insights, Security, Database Health, Workload Trends, and Schema Explorer.
+
+Reports are uploaded to S3 alongside the JSON data:
 ```
 s3://wal-db-stats-collection-<account-id>/db-stats/<timestamp>/
+├── database-1_invasive_data.json           (raw data for SA)
+├── database-1_invasive_report.html         (interactive visual report)
+├── database-1_non_invasive_data.json
+├── database-1_non_invasive_report.html
+└── ...
 ```
+
+Download and open any `*_report.html` file in your browser — no internet connection, server, or additional software required. 
 
 ### (Optional) Collect CloudWatch metrics only
 
