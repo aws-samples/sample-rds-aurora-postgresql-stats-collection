@@ -2,13 +2,15 @@
 
 > **Disclaimer**: This tool collects database metrics and configuration data from your AWS environment for Well-Architected review purposes. Review the README.MD carefully and test against your staging/QA environment first to understand the scipts and data collected. Review the data collected before sharing and ensure it complies with your organization's data sharing policies. Please issue a support case to share any data collected to AWS. If any concerns, please reach back to your account SA and proceed with ad-hoc data collection using the issued support case.
 
+![DB Metrics Report Demo](demo/demo-metrics.gif)
+
 ## What this does
 
 Deploys a lightweight EC2 instance in your AWS account that:
 - Discovers all PostgreSQL databases (Aurora and RDS) in your account/region
-- Collects CloudWatch metrics, Performance Insights data, and database configuration
-- Collects deeper database statistics (requires AWS Secrets Manager to access DB from your account)
-- Generates interactive HTML reports for visual exploration of collected metrics (optional)
+- Collects [CloudWatch metrics](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.AuroraMonitoring.Metrics.html), [Performance Insights](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/USER_DatabaseInsights.html) data, and database configuration
+- Collects deeper database statistics — query performance (`pg_stat_statements`), table/index bloat, health insights, and workload trends via [PGPerfStatsSnapper](https://github.com/aws-samples/aurora-and-database-migration-labs/tree/master/Code/PGPerfStatsSnapper) (requires [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html) to access DB from your account)
+- Generates interactive HTML reports for visual exploration of collected metrics
 - Uploads collected data to an S3 bucket in your account for review
 
 ## Prerequisites
@@ -107,6 +109,8 @@ Database statistics and metrics collection gathers CloudWatch metrics (7 days), 
 
 > **Note**: Database statistics and metrics collection runs read-only queries against your database. No data is modified. Queries are lightweight and designed to have minimal performance impact. Test with your QA/test environment to understand the metrics collected before running against production. If you have concerns about direct database access, see [(Optional) Collect CloudWatch metrics only](#optional-collect-cloudwatch-metrics-only) — however, skipping in-depth database statistics and metrics collection limits the SA's ability to identify slow queries and top SQL by execution time (`pg_stat_statements`), table-level bloat and sequential scan patterns (`pg_stat_user_tables`), unused and redundant indexes (`pg_stat_user_indexes`), checkpoint and buffer write pressure (`pg_stat_bgwriter`), and historical workload trends from PGPerfStatsSnapper snapshots. These are the primary inputs for Well Architected Review tuning recommendations.
 
+### Step 3.1 Enable database statistics collection
+
 Run `enable-invasive-collection.sh` once per cluster. Each call registers that cluster for invasive collection — you can enable as many clusters as needed before running `collect-and-share.sh`.
 
 ```bash
@@ -150,6 +154,8 @@ Example:
 
 With the example above (`pgsnapper-min-days=1`, `pgsnapper-interval=60`), wait at least 1 day between runs. For a quick test, use `pgsnapper-min-days=0.01` (~15 minutes) and `pgsnapper-interval=1` (1 minute interval).
 
+### Step 3.2 Run collection and generate reports
+
 Database statistics and metrics collection requires **two runs** of `./collect-and-share.sh`:
 
 1. **Run 1 (setup only)** — installs the PGSnapper cron job and runs an initial snapshot to verify connectivity. **No data collection happens on this run** — no non-invasive metrics, no database statistics, no schema or query performance data. This keeps Run 1 fast and avoids collecting data that would be stale by Run 2.
@@ -162,36 +168,17 @@ Database statistics and metrics collection requires **two runs** of `./collect-a
 
 # Wait for pgsnapper-min-days worth of snapshots...
 
-# Run 2 — collects all data (non-invasive + invasive) with aligned timestamps
-./collect-and-share.sh
+# Run 2 — collects all data + generates interactive HTML reports
+./collect-and-share.sh --generate-report --skip-security
 ```
 
 > **Note**: If the initial snapshot fails during Run 1 (bad credentials, network issue, etc.), the cron job will **not** be installed. Fix the underlying issue and re-run `./collect-and-share.sh` — it will detect that setup is still needed and retry.
 
+> **Note**: `--skip-security` excludes security-related queries (user roles, privileges, SSL, passwords, RLS, audit config) from the collection. Remove the flag if you want security data collected.
 
-> **Note**: To exclude security-related queries (user roles, privileges, SSL, passwords, RLS, audit config) from the collection, pass `--skip-security` to `collect-and-share.sh`:
-> ```bash
-> ./collect-and-share.sh --skip-security
-> ```
+> **Note**: `--generate-report` produces a self-contained interactive HTML report for each database (7 tabs: Configuration, CloudWatch Metrics, Performance Insights, Security, Database Health, Workload Trends, Schema Explorer). Open the `*_report.html` file in any browser — no internet, server, or additional software required.
 
-### (Optional) Generate interactive HTML reports
-
-![DB Metrics Report Demo](demo/demo-metrics.gif)
-
-To generate self-contained HTML reports that can be opened in any browser without a server, pass `--generate-report`:
-
-```bash
-./collect-and-share.sh --generate-report
-```
-
-> Flags can be combined:
-> ```bash
-> ./collect-and-share.sh --generate-report --skip-security
-> ```
-
-This produces an interactive HTML report for each collected database alongside the JSON data. The reports provide a visual DB Metrics Explorer with 7 tabs: Configuration, CloudWatch Metrics, Performance Insights, Security, Database Health, Workload Trends, and Schema Explorer.
-
-Reports are uploaded to S3 alongside the JSON data:
+Collected data and reports are uploaded to S3:
 ```
 s3://wal-db-stats-collection-<account-id>/db-stats/<timestamp>/
 ├── database-1_invasive_data.json           (raw data for SA)
@@ -200,8 +187,6 @@ s3://wal-db-stats-collection-<account-id>/db-stats/<timestamp>/
 ├── database-1_non_invasive_report.html
 └── ...
 ```
-
-Download and open any `*_report.html` file in your browser — no internet connection, server, or additional software required. 
 
 ### (Optional) Collect CloudWatch metrics only
 
