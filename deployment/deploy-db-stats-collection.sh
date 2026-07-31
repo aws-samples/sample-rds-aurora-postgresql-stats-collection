@@ -53,6 +53,10 @@ while [[ $# -gt 0 ]]; do
             ASSIGN_PUBLIC_IP="false"
             shift
             ;;
+        --create-ssm-endpoints)
+            CREATE_SSM_ENDPOINTS="true"
+            shift
+            ;;
         --sa-data-bucket)
             SA_DATA_BUCKET="$2"
             shift 2
@@ -78,6 +82,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --instance-type TYPE            Instance type (default: t3.medium)"
             echo "  --allowed-cidr CIDR             Allowed CIDR for SSH (required when using public IP; e.g. \$(curl -s ifconfig.me)/32 — 0.0.0.0/0 is rejected)
   --no-public-ip                    Deploy without public IP (private subnet + SSM access; --allowed-cidr not required)
+  --create-ssm-endpoints           Create VPC Interface Endpoints for SSM/SSMMessages/EC2Messages (~$0.03/hr).
+                                   Use when your VPC does not already have these endpoints.
+                                   If your VPC already has them, omit this flag — the deploy script reuses them.
   --db-port PORT                  PostgreSQL port on target RDS/Aurora endpoint for invasive collection (default: 5432)"
             echo "  --sa-data-bucket BUCKET         S3 bucket name for SA data sharing (optional)"
             echo "  --enable-scheduled true/false   Enable scheduled data collection (default: true)"
@@ -109,8 +116,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Validate required parameters
-if [[ -z "$KEY_PAIR" ]]; then
-    echo "❌ Error: --key-pair is required"
+# --key-pair is only required when using a public IP (SSH access).
+# When --no-public-ip is set, SSM Session Manager is used instead — no key pair needed.
+if [[ -z "$KEY_PAIR" ]] && [[ "${ASSIGN_PUBLIC_IP:-true}" == "true" ]]; then
+    echo "❌ Error: --key-pair is required when using a public IP"
+    echo "   Use --no-public-ip to deploy without a key pair (SSM Session Manager access)"
     exit 1
 fi
 
@@ -143,6 +153,37 @@ if [[ "$ALLOWED_CIDR" == "0.0.0.0/0" ]]; then
     exit 1
 fi
 SA_DATA_BUCKET=${SA_DATA_BUCKET:-""}
+
+# ── Pre-flight check: --no-public-ip requires NAT Gateway or VPC endpoints ──
+if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]]; then
+    echo "🔍 Checking network prerequisites for --no-public-ip mode..."
+    HAS_NAT=$(aws ec2 describe-route-tables \
+        --filters "Name=association.subnet-id,Values=$SUBNET_ID" \
+        --region "$REGION" \
+        --query 'RouteTables[0].Routes[?NatGatewayId!=null].NatGatewayId' \
+        --output text 2>/dev/null)
+    if [ -n "$HAS_NAT" ] && [ "$HAS_NAT" != "None" ]; then
+        echo "   ✅ NAT Gateway found on subnet route table ($HAS_NAT)"
+        echo "      Bootstrap will route outbound traffic through NAT."
+    else
+        echo ""
+        echo "❌ Error: --no-public-ip requires a subnet with a NAT Gateway."
+        echo ""
+        echo "   The EC2 instance bootstrap needs outbound internet access to:"
+        echo "     - Install packages (dnf)"
+        echo "     - Download application code (git / S3 fallback)"
+        echo "     - Install Python dependencies (pip)"
+        echo "     - Signal CloudFormation on completion (cfn-signal)"
+        echo ""
+        echo "   Subnet $SUBNET_ID has no NAT Gateway on its route table."
+        echo "   Without outbound internet, the bootstrap will hang and the stack will fail."
+        echo ""
+        echo "   To fix: use a private subnet that routes 0.0.0.0/0 through a NAT Gateway."
+        echo "   See README for --no-public-ip prerequisites."
+        echo ""
+        exit 1
+    fi
+fi
 
 # Upload code to S3 as fallback (CFN tries git clone first, falls back to S3)
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "$REGION")
@@ -197,6 +238,21 @@ ZIP_PATH="$REPO_ROOT/$ZIP_NAME"
 
 echo "📦 Uploading code to S3..."
 aws s3 mb "s3://$CODE_BUCKET" --region "$REGION" 2>/dev/null || true
+
+# Harden the temporary code bucket — public access block + SSE encryption.
+# This bucket is ephemeral (deleted after stack creation) but must be secure
+# during the ~15-minute bootstrap window.
+aws s3api put-public-access-block \
+    --bucket "$CODE_BUCKET" --region "$REGION" \
+    --public-access-block-configuration \
+    "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true" \
+    2>/dev/null || true
+aws s3api put-bucket-encryption \
+    --bucket "$CODE_BUCKET" --region "$REGION" \
+    --server-side-encryption-configuration \
+    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"},"BucketKeyEnabled":true}]}' \
+    2>/dev/null || true
+
 aws s3 cp "$ZIP_PATH" "s3://$CODE_BUCKET/$CODE_KEY" --region "$REGION"
 
 # Determine the data bucket name.
@@ -243,12 +299,13 @@ aws cloudformation "$OPERATION" \
     --stack-name "$STACK_NAME" \
     --template-body "file://$TEMPLATE_FILE" \
     --parameters \
-        "ParameterKey=KeyPairName,ParameterValue=$KEY_PAIR" \
+        "ParameterKey=KeyPairName,ParameterValue=${KEY_PAIR:-}" \
         "ParameterKey=VpcId,ParameterValue=$VPC_ID" \
         "ParameterKey=SubnetId,ParameterValue=$SUBNET_ID" \
         "ParameterKey=InstanceType,ParameterValue=$INSTANCE_TYPE" \
         "ParameterKey=AllowedCIDR,ParameterValue=$ALLOWED_CIDR" \
         "ParameterKey=AssignPublicIP,ParameterValue=${ASSIGN_PUBLIC_IP:-true}" \
+        "ParameterKey=CreateSSMEndpoints,ParameterValue=${CREATE_SSM_ENDPOINTS:-false}" \
         "ParameterKey=DBPort,ParameterValue=${DB_PORT:-5432}" \
         "ParameterKey=SADataBucket,ParameterValue=$SA_DATA_BUCKET" \
         "ParameterKey=ResolvedDataBucketName,ParameterValue=$RESOLVED_DATA_BUCKET" \
@@ -263,6 +320,84 @@ echo "⏳ Waiting for stack operation to complete..."
 aws cloudformation wait "stack-${OPERATION%-stack}-complete" \
     --stack-name "$STACK_NAME" \
     --region "$REGION"
+
+# ── Post-deploy: configure pre-existing SSM endpoints for --no-public-ip ────
+# If the VPC already has SSM endpoints (CreateSSMEndpoints=false / default),
+# the deploy script ensures they include this stack's subnet and instance SG.
+# This makes SSM Session Manager work without creating duplicate endpoints.
+if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]] && [[ "${CREATE_SSM_ENDPOINTS:-false}" == "false" ]]; then
+    echo ""
+    echo "🔗 Configuring pre-existing SSM endpoints for this deployment..."
+
+    # Get the instance security group from CFN outputs
+    INSTANCE_SG=$(aws cloudformation describe-stacks \
+        --stack-name "$STACK_NAME" --region "$REGION" \
+        --query 'Stacks[0].Outputs[?OutputKey==`InstanceSecurityGroup`].OutputValue' \
+        --output text 2>/dev/null)
+
+    if [ -n "$INSTANCE_SG" ] && [ "$INSTANCE_SG" != "None" ]; then
+        for SVC in ssm ssmmessages ec2messages; do
+            # Find the endpoint for this service in this VPC
+            ENDPOINT_ID=$(aws ec2 describe-vpc-endpoints \
+                --region "$REGION" \
+                --filters "Name=service-name,Values=com.amazonaws.${REGION}.${SVC}" \
+                          "Name=vpc-id,Values=${VPC_ID}" \
+                          "Name=vpc-endpoint-state,Values=available" \
+                --query 'VpcEndpoints[0].VpcEndpointId' \
+                --output text 2>/dev/null)
+
+            if [ -z "$ENDPOINT_ID" ] || [ "$ENDPOINT_ID" == "None" ]; then
+                echo "   ⚠️  No existing $SVC endpoint found in $VPC_ID."
+                echo "      Re-run with --create-ssm-endpoints to create it, or create it manually."
+                continue
+            fi
+
+            # Add subnet if not already present
+            EXISTING_SUBNETS=$(aws ec2 describe-vpc-endpoints \
+                --vpc-endpoint-ids "$ENDPOINT_ID" --region "$REGION" \
+                --query 'VpcEndpoints[0].SubnetIds' --output text 2>/dev/null)
+            if echo "$EXISTING_SUBNETS" | grep -qw "$SUBNET_ID"; then
+                echo "   ✅ $SVC ($ENDPOINT_ID): subnet already present"
+            else
+                aws ec2 modify-vpc-endpoint \
+                    --vpc-endpoint-id "$ENDPOINT_ID" \
+                    --add-subnet-ids "$SUBNET_ID" \
+                    --region "$REGION" --output text > /dev/null 2>&1 \
+                    && echo "   ✅ $SVC ($ENDPOINT_ID): added subnet $SUBNET_ID" \
+                    || echo "   ⚠️  $SVC: could not add subnet (check permissions)"
+            fi
+
+            # Add instance SG to endpoint's inbound rules if not already present
+            ENDPOINT_SG=$(aws ec2 describe-vpc-endpoints \
+                --vpc-endpoint-ids "$ENDPOINT_ID" --region "$REGION" \
+                --query 'VpcEndpoints[0].Groups[0].GroupId' --output text 2>/dev/null)
+            if [ -n "$ENDPOINT_SG" ] && [ "$ENDPOINT_SG" != "None" ]; then
+                # Check if rule already exists
+                RULE_EXISTS=$(aws ec2 describe-security-group-rules \
+                    --filters "Name=group-id,Values=${ENDPOINT_SG}" \
+                              "Name=referenced-group-id,Values=${INSTANCE_SG}" \
+                    --region "$REGION" \
+                    --query 'SecurityGroupRules[?FromPort==`443`].SecurityGroupRuleId' \
+                    --output text 2>/dev/null)
+                if [ -n "$RULE_EXISTS" ] && [ "$RULE_EXISTS" != "None" ]; then
+                    echo "   ✅ $SVC endpoint SG: inbound rule already exists"
+                else
+                    aws ec2 authorize-security-group-ingress \
+                        --group-id "$ENDPOINT_SG" \
+                        --protocol tcp --port 443 \
+                        --source-group "$INSTANCE_SG" \
+                        --region "$REGION" --output text > /dev/null 2>&1 \
+                        && echo "   ✅ $SVC endpoint SG: added inbound TCP/443 from $INSTANCE_SG" \
+                        || echo "   ⚠️  $SVC: could not add SG rule (may already exist)"
+                fi
+            fi
+        done
+        echo "   SSM endpoint configuration complete."
+    else
+        echo "   ⚠️  Could not retrieve instance security group — SSM endpoint configuration skipped."
+        echo "      You may need to manually add this stack's SG to existing SSM VPC endpoint SGs."
+    fi
+fi
 
 # Get outputs
 echo ""
@@ -359,3 +494,30 @@ echo "3. Share collected data with your SA"
 echo "4. SA will process your data and perform analysis"
 echo "5. SA will provide comprehensive Well Architected Review reports and recommendations"
 echo ""
+
+# ── Clean up temporary code bucket ───────────────────────────────────────────
+# The code bucket is only needed during EC2 bootstrap (UserData downloads the
+# zip once). Remove the zip and attempt to delete the bucket to avoid leaving
+# a persistent resource in the customer account.
+echo "🧹 Cleaning up bootstrap code bucket..."
+
+# Remove only the zip we uploaded — never touch other objects
+aws s3 rm "s3://$CODE_BUCKET/$CODE_KEY" --region "$REGION" 2>/dev/null || true
+
+# Delete bucket only if empty (safe — fails silently if other objects are present)
+if aws s3api delete-bucket --bucket "$CODE_BUCKET" --region "$REGION" 2>/dev/null; then
+    echo "   ✅ Temporary code bucket deleted: s3://$CODE_BUCKET"
+else
+    # Bucket still exists — likely contains other objects not uploaded by this script.
+    # Re-apply security settings so it stays hardened regardless.
+    aws s3api put-public-access-block \
+        --bucket "$CODE_BUCKET" --region "$REGION" \
+        --public-access-block-configuration \
+        "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true" \
+        2>/dev/null || true
+    echo "   ⚠️  Code bucket s3://$CODE_BUCKET could not be deleted (it may contain"
+    echo "      other objects). The bootstrap zip has been removed. The bucket remains"
+    echo "      encrypted and with public access blocked."
+    echo "      You can safely delete it manually when no longer needed:"
+    echo "      aws s3 rb s3://$CODE_BUCKET --force --region $REGION"
+fi

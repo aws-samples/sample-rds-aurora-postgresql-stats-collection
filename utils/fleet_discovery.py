@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Fleet discovery module for PostgreSQL databases.
-Discovers Aurora clusters and RDS instances across account/region.
+Discovers Aurora clusters, RDS Multi-AZ DB Clusters, and standalone RDS instances.
 """
 
 import logging
@@ -15,6 +15,45 @@ class FleetDiscovery:
         self.region = region
         self.rds_client = boto3.client('rds', region_name=region)
         self.logger = logging.getLogger(__name__)
+
+    def discover_rds_multiaz_clusters(self) -> List[Dict[str, Any]]:
+        """Discover RDS Multi-AZ DB Clusters (engine='postgres', not 'aurora-postgresql').
+
+        These use the same cluster API as Aurora but are standard PostgreSQL with
+        synchronous streaming replication to 2 readable standbys. Their member
+        instances share a DBClusterIdentifier but must NOT be collected as
+        standalone rds_instance entries — the cluster is the top-level entity.
+        """
+        try:
+            self.logger.info("Discovering RDS Multi-AZ DB Clusters...")
+
+            paginator = self.rds_client.get_paginator('describe_db_clusters')
+            clusters = []
+
+            for page in paginator.paginate(
+                Filters=[{'Name': 'engine', 'Values': ['postgres']}]
+            ):
+                for cluster in page['DBClusters']:
+                    tags = self._get_cluster_tags(cluster['DBClusterArn'])
+                    clusters.append({
+                        'identifier': cluster['DBClusterIdentifier'],
+                        'engine': cluster['Engine'],
+                        'engine_version': cluster['EngineVersion'],
+                        'status': cluster['Status'],
+                        'multi_az': cluster['MultiAZ'],
+                        'instance_class': cluster.get('DBClusterInstanceClass', 'N/A'),
+                        'type': 'rds_multiaz_cluster',
+                        'wal_framework': 'RDS_PostgreSQL_CustomLens_v1.json',
+                        'tags': tags,
+                        'arn': cluster['DBClusterArn'],
+                    })
+
+            self.logger.info(f"Found {len(clusters)} RDS Multi-AZ DB Clusters")
+            return clusters
+
+        except ClientError as e:
+            self.logger.error(f"Error discovering RDS Multi-AZ clusters: {e}")
+            return []
 
     def discover_aurora_clusters(self) -> List[Dict[str, Any]]:
         """Discover Aurora PostgreSQL clusters."""
@@ -57,8 +96,9 @@ class FleetDiscovery:
             for page in paginator.paginate(Filters=[{'Name': 'engine', 'Values': ['postgres']}]):
               for instance in page['DBInstances']:
                 # Skip instances that belong to an Aurora cluster — those are collected
-                # via discover_aurora_clusters. Multi-AZ DB clusters also set
-                # DBClusterIdentifier but use engine 'postgres', so we keep those.
+                # via discover_aurora_clusters.
+                # Also skip instances that belong to an RDS Multi-AZ DB Cluster — those
+                # are collected via discover_rds_multiaz_clusters as a cluster entity.
                 cluster_id = instance.get('DBClusterIdentifier')
                 if cluster_id:
                     try:
@@ -66,7 +106,8 @@ class FleetDiscovery:
                             DBClusterIdentifier=cluster_id
                         )
                         cluster_engine = cluster_resp['DBClusters'][0].get('Engine', '')
-                        if cluster_engine.startswith('aurora'):
+                        # Skip Aurora members AND RDS Multi-AZ DB Cluster members
+                        if cluster_engine.startswith('aurora') or cluster_engine == 'postgres':
                             continue
                     except ClientError:
                         pass  # If we can't describe the cluster, include the instance
@@ -94,11 +135,14 @@ class FleetDiscovery:
     def discover_fleet(self, include_aurora: bool = True, include_rds: bool = True) -> List[Dict[str, Any]]:
         """Discover all PostgreSQL databases in the fleet."""
         fleet = []
-        
+
         if include_aurora:
             fleet.extend(self.discover_aurora_clusters())
-        
+
         if include_rds:
+            # RDS Multi-AZ DB Clusters first — their member instances are then skipped
+            # by discover_rds_instances() to avoid duplicate/disconnected entries.
+            fleet.extend(self.discover_rds_multiaz_clusters())
             fleet.extend(self.discover_rds_instances())
         
         # Filter by status (only include available databases)
