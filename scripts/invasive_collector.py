@@ -516,9 +516,16 @@ class InvasiveCollector(NonInvasiveCollector):
         extensions = {row['extname'] for row in cursor.fetchall()}
         has_pg_stat_statements = 'pg_stat_statements' in extensions
         
-        # Detect deployment type from the database_type already determined by _detect_db_type() via RDS API
-        # Falls back to hostname heuristic if not available in the collected data
-        deployment_type = 'Aurora' if getattr(self, '_detected_db_type', '') == 'aurora_cluster' or '.cluster-' in self.db_host else 'RDS'
+        # Determine deployment type from the API-detected db type.
+        # Do NOT use hostname heuristics — both Aurora and RDS Multi-AZ DB Clusters
+        # use the .cluster-xxx endpoint format, making hostname patterns unreliable.
+        _detected = getattr(self, '_detected_db_type', '')
+        if _detected == 'aurora_cluster':
+            deployment_type = 'Aurora'
+        elif _detected == 'rds_multiaz_cluster':
+            deployment_type = 'RDS Multi-AZ DB Cluster'
+        else:
+            deployment_type = 'RDS'
         
         def _run(sql, **kwargs):
             """Execute query safely, return list of dicts or [] on error."""
@@ -873,9 +880,41 @@ class InvasiveCollector(NonInvasiveCollector):
                 '-m', 'snap', '-o', output_dir, '-r', region
             ]
             pgsnapper_cmd = ' '.join(pgsnapper_args)
+            # FLAGS_DIR is the canonical location written by enable-invasive-collection.sh.
+            # The wrapper checks it on every cron execution so the cron self-terminates
+            # when collection is no longer needed — even if collect-and-share.sh's own
+            # removal logic was never reached (e.g. flag file deleted, instance abandoned).
+            flags_dir = '/home/ec2-user/wal-db-stats-collection/data/flags'
             wrapper_content = f"""#!/bin/bash
 export PATH=/usr/pgsql-15/bin:/usr/local/pgsql/bin:$PATH
 export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
+
+# ── Self-guard: stop snapshotting when collection is no longer needed ───
+FLAGS_DIR="{flags_dir}"
+
+# Guard 1: no flag files present → cluster was deregistered, remove cron and exit
+if ! ls "$FLAGS_DIR"/*.flag > /dev/null 2>&1; then
+    crontab -l 2>/dev/null | grep -v 'pgsnapper_snap.sh' | crontab - 2>/dev/null
+    exit 0
+fi
+
+# Guard 2: all registered clusters have status=analyzed → Run 2 succeeded,
+# collection is complete. Remove cron and exit.
+ALL_DONE=true
+for STATUS_FILE in "$FLAGS_DIR"/*_pgsnapper_status.json; do
+    [ -f "$STATUS_FILE" ] || {{ ALL_DONE=false; break; }}
+    STATUS=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('status',''))" "$STATUS_FILE" 2>/dev/null)
+    if [ "$STATUS" != "analyzed" ]; then
+        ALL_DONE=false
+        break
+    fi
+done
+if [ "$ALL_DONE" = "true" ]; then
+    crontab -l 2>/dev/null | grep -v 'pgsnapper_snap.sh' | crontab - 2>/dev/null
+    exit 0
+fi
+# ────────────────────────────────────────────────────────────────────────
+
 {pgsnapper_cmd} >> {log_file} 2>&1
 """
             # Remove existing wrapper if present (previous run sets 0o500 = no write)
@@ -1426,14 +1465,14 @@ export LD_LIBRARY_PATH=/usr/pgsql-15/lib:/usr/local/pgsql/lib
             }
 
     def _detect_db_type(self, identifier: str) -> Dict[str, str]:
-        """Detect whether identifier is an Aurora cluster or RDS instance."""
+        """Detect whether identifier is an Aurora cluster, RDS Multi-AZ DB Cluster, or RDS instance."""
         try:
             response = self.rds_client.describe_db_clusters(DBClusterIdentifier=identifier)
             engine = response['DBClusters'][0].get('Engine', '')
             if engine.startswith('aurora'):
                 return {'type': 'aurora_cluster', 'wal_framework': 'AuroraPostgreSQL_CustomLens_v1.json'}
-            # Multi-AZ DB cluster (engine='postgres') — treat as rds_instance
-            return {'type': 'rds_instance', 'wal_framework': 'RDS_PostgreSQL_CustomLens_v1.json'}
+            # engine='postgres' at cluster level → RDS Multi-AZ DB Cluster (not Aurora)
+            return {'type': 'rds_multiaz_cluster', 'wal_framework': 'RDS_PostgreSQL_CustomLens_v1.json'}
         except ClientError:
             pass
         return {'type': 'rds_instance', 'wal_framework': 'RDS_PostgreSQL_CustomLens_v1.json'}

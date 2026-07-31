@@ -44,15 +44,32 @@ class NonInvasiveCollector:
         )
         self.logger = logging.getLogger(__name__)
 
+    def _get_writer_instance_id(self, cluster_id: str) -> str | None:
+        """Return the DBInstanceIdentifier of the writer for an RDS Multi-AZ DB Cluster.
+
+        Uses describe_db_clusters → DBClusterMembers[].IsClusterWriter which is the
+        authoritative API source. Never relies on hostname patterns or external hints.
+        """
+        try:
+            resp = self.rds_client.describe_db_clusters(DBClusterIdentifier=cluster_id)
+            for member in resp['DBClusters'][0].get('DBClusterMembers', []):
+                if member.get('IsClusterWriter'):
+                    return member['DBInstanceIdentifier']
+        except ClientError as e:
+            self.logger.warning(f"Could not resolve writer for {cluster_id}: {e}")
+        return None
+
     def collect_database_configuration(self, database_info: Dict[str, Any]) -> Dict[str, Any]:
-        """Collect database configuration details (Aurora cluster or RDS instance)."""
+        """Collect database configuration details (Aurora cluster, RDS Multi-AZ DB Cluster, or RDS instance)."""
         db_id = database_info['identifier']
         db_type = database_info['type']
         try:
             self.logger.info(f"Collecting configuration for {db_type}: {db_id}")
-            
-            if db_type == 'aurora_cluster':
-                return self._collect_aurora_cluster_config(db_id)
+
+            if db_type in ('aurora_cluster', 'rds_multiaz_cluster'):
+                # Both Aurora and RDS Multi-AZ DB Cluster use the same cluster API shape:
+                # describe_db_clusters + enumerate member instances via DBClusterIdentifier.
+                return self._collect_cluster_config(db_id, db_type)
             else:
                 return self._collect_rds_instance_config(db_id)
                 
@@ -60,17 +77,33 @@ class NonInvasiveCollector:
             self.logger.error(f"Error collecting configuration for {db_id}: {e}")
             raise
 
-    def _collect_aurora_cluster_config(self, cluster_id: str) -> Dict[str, Any]:
-        """Collect Aurora cluster configuration details."""
+    def _collect_cluster_config(self, cluster_id: str, db_type: str) -> Dict[str, Any]:
+        """Collect cluster configuration for Aurora or RDS Multi-AZ DB Cluster.
+
+        Both share the same API shape: describe_db_clusters for the cluster entity,
+        then enumerate member instances. The output structure is cluster + instances[],
+        with each instance annotated with its role (writer/readable_standby) sourced
+        from DBClusterMembers[].IsClusterWriter — the authoritative API field.
+        """
         try:
-            self.logger.info(f"Collecting cluster configuration for {cluster_id}")
-            
-            # Get cluster details
+            self.logger.info(f"Collecting cluster configuration for {cluster_id} ({db_type})")
+
             cluster_response = self.rds_client.describe_db_clusters(
                 DBClusterIdentifier=cluster_id
             )
             cluster = cluster_response['DBClusters'][0]
-            
+
+            # Build writer-lookup from cluster members for role annotation
+            writer_set = {
+                m['DBInstanceIdentifier']
+                for m in cluster.get('DBClusterMembers', [])
+                if m.get('IsClusterWriter')
+            }
+            promotion_tiers = {
+                m['DBInstanceIdentifier']: m.get('PromotionTier', 1)
+                for m in cluster.get('DBClusterMembers', [])
+            }
+
             # Get instance details (paginated)
             paginator = self.rds_client.get_paginator('describe_db_instances')
             cluster_instances = [
@@ -79,36 +112,54 @@ class NonInvasiveCollector:
                 for instance in page['DBInstances']
                 if instance.get('DBClusterIdentifier') == cluster_id
             ]
-            
-            config_data = {
-                'cluster': {
-                    'identifier': cluster['DBClusterIdentifier'],
-                    'engine': cluster['Engine'],
-                    'engine_version': cluster['EngineVersion'],
-                    'status': cluster['Status'],
-                    'multi_az': cluster['MultiAZ'],
-                    'backup_retention_period': cluster['BackupRetentionPeriod'],
-                    'preferred_backup_window': cluster['PreferredBackupWindow'],
-                    'preferred_maintenance_window': cluster['PreferredMaintenanceWindow'],
-                    'encrypted': cluster['StorageEncrypted'],
-                    'kms_key_id': cluster.get('KmsKeyId'),
-                    'deletion_protection': cluster['DeletionProtection'],
-                    'engine_lifecycle_support': cluster.get('EngineLifecycleSupport', 'open-source-rds-extended-support-disabled'),
-                    'global_cluster_identifier': cluster.get('GlobalClusterIdentifier'),
-                    'availability_zones': cluster['AvailabilityZones'],
-                    'vpc_security_groups': [sg['VpcSecurityGroupId'] for sg in cluster['VpcSecurityGroups']],
-                    'db_subnet_group': cluster['DBSubnetGroup'],
-                    'parameter_group': cluster['DBClusterParameterGroup'],
-                    'endpoint': cluster['Endpoint'],
-                    'reader_endpoint': cluster['ReaderEndpoint'],
-                    'reader_instances': sum(1 for m in cluster.get('DBClusterMembers', []) if not m.get('IsClusterWriter', True))
-                },
-                'instances': []
+
+            # Base cluster config — common to Aurora and RDS Multi-AZ DB Cluster
+            cluster_cfg: Dict[str, Any] = {
+                'identifier': cluster['DBClusterIdentifier'],
+                'engine': cluster['Engine'],
+                'engine_version': cluster['EngineVersion'],
+                'status': cluster['Status'],
+                'multi_az': cluster['MultiAZ'],
+                'backup_retention_period': cluster['BackupRetentionPeriod'],
+                'preferred_backup_window': cluster['PreferredBackupWindow'],
+                'preferred_maintenance_window': cluster['PreferredMaintenanceWindow'],
+                'encrypted': cluster['StorageEncrypted'],
+                'kms_key_id': cluster.get('KmsKeyId'),
+                'deletion_protection': cluster['DeletionProtection'],
+                'availability_zones': cluster['AvailabilityZones'],
+                'vpc_security_groups': [sg['VpcSecurityGroupId'] for sg in cluster['VpcSecurityGroups']],
+                'db_subnet_group': cluster['DBSubnetGroup'],
+                'parameter_group': cluster['DBClusterParameterGroup'],
+                'endpoint': cluster['Endpoint'],
+                'reader_endpoint': cluster.get('ReaderEndpoint'),
+                'reader_instances': sum(
+                    1 for m in cluster.get('DBClusterMembers', [])
+                    if not m.get('IsClusterWriter', True)
+                ),
             }
-            
+
+            # Aurora-specific fields
+            if db_type == 'aurora_cluster':
+                cluster_cfg['engine_lifecycle_support'] = cluster.get(
+                    'EngineLifecycleSupport', 'open-source-rds-extended-support-disabled'
+                )
+                cluster_cfg['global_cluster_identifier'] = cluster.get('GlobalClusterIdentifier')
+
+            # RDS Multi-AZ DB Cluster specific fields
+            if db_type == 'rds_multiaz_cluster':
+                cluster_cfg['cluster_type'] = 'multi_az_db_cluster'
+                cluster_cfg['instance_class'] = cluster.get('DBClusterInstanceClass', 'N/A')
+
+            config_data: Dict[str, Any] = {
+                'cluster': cluster_cfg,
+                'instances': [],
+            }
+
             for instance in cluster_instances:
-                instance_data = {
-                    'identifier': instance['DBInstanceIdentifier'],
+                inst_id = instance['DBInstanceIdentifier']
+                role = 'writer' if inst_id in writer_set else 'readable_standby'
+                instance_data: Dict[str, Any] = {
+                    'identifier': inst_id,
                     'class': instance['DBInstanceClass'],
                     'status': instance['DBInstanceStatus'],
                     'availability_zone': instance['AvailabilityZone'],
@@ -117,16 +168,24 @@ class NonInvasiveCollector:
                     'performance_insights_enabled': instance['PerformanceInsightsEnabled'],
                     'performance_insights_retention_period': instance.get('PerformanceInsightsRetentionPeriod'),
                     'auto_minor_version_upgrade': instance['AutoMinorVersionUpgrade'],
-                    'promotion_tier': instance.get('PromotionTier', 0),
-                    'endpoint': instance['Endpoint']['Address'] if 'Endpoint' in instance else None
+                    'promotion_tier': promotion_tiers.get(inst_id, 1),
+                    'endpoint': instance['Endpoint']['Address'] if 'Endpoint' in instance else None,
+                    'role': role,
                 }
                 config_data['instances'].append(instance_data)
-            
+
+            # Writer first for consistent ordering
+            config_data['instances'].sort(key=lambda x: (0 if x['role'] == 'writer' else 1))
+
             return config_data
-            
+
         except ClientError as e:
-            self.logger.error(f"Error collecting Aurora cluster configuration for {cluster_id}: {e}")
+            self.logger.error(f"Error collecting cluster configuration for {cluster_id}: {e}")
             raise
+
+    def _collect_aurora_cluster_config(self, cluster_id: str) -> Dict[str, Any]:
+        """Collect Aurora cluster configuration details. Delegates to _collect_cluster_config."""
+        return self._collect_cluster_config(cluster_id, 'aurora_cluster')
 
     def _collect_rds_instance_config(self, instance_id: str) -> Dict[str, Any]:
         """Collect RDS instance configuration details."""
@@ -227,8 +286,8 @@ class NonInvasiveCollector:
 
             parameters: List[Dict[str, Any]] = []
 
-            if db_type == 'aurora_cluster':
-                # Get cluster parameter group name
+            if db_type in ('aurora_cluster', 'rds_multiaz_cluster'):
+                # Both use a cluster parameter group via describe_db_clusters
                 cluster_resp = self.rds_client.describe_db_clusters(
                     DBClusterIdentifier=db_id
                 )
@@ -362,13 +421,32 @@ class NonInvasiveCollector:
                 'ReplicationSlotDiskUsage', 'TransactionLogsDiskUsage', 'TransactionLogsGeneration'
             ]
             
-            # Select appropriate metrics based on database type
+            # Select appropriate metrics and CW dimension based on database type
             if db_type == 'aurora_cluster':
                 metrics_to_collect = aurora_metrics
                 dimension_name = 'DBClusterIdentifier'
+                cw_id = db_id
+            elif db_type == 'rds_multiaz_cluster':
+                # RDS Multi-AZ DB Cluster: CW metrics are published per-instance, NOT per-cluster.
+                # The writer publishes write-path metrics (WriteIOPS, CheckpointLag, TransactionLogs*).
+                # Use the writer instance ID resolved from describe_db_clusters → IsClusterWriter.
+                metrics_to_collect = rds_metrics
+                dimension_name = 'DBInstanceIdentifier'
+                writer_id = self._get_writer_instance_id(db_id)
+                if writer_id:
+                    cw_id = writer_id
+                    self.logger.info(
+                        f"RDS Multi-AZ cluster: collecting CW metrics from writer {writer_id}"
+                    )
+                else:
+                    cw_id = db_id
+                    self.logger.warning(
+                        f"Could not resolve writer for {db_id} — using cluster ID (metrics may be empty)"
+                    )
             else:
                 metrics_to_collect = rds_metrics
                 dimension_name = 'DBInstanceIdentifier'
+                cw_id = db_id
             
             metrics_data = {}
             
@@ -380,7 +458,7 @@ class NonInvasiveCollector:
                         Dimensions=[
                             {
                                 'Name': dimension_name,
-                                'Value': db_id
+                                'Value': cw_id
                             }
                         ],
                         StartTime=start_time,
@@ -399,6 +477,34 @@ class NonInvasiveCollector:
                     self.logger.warning(f"Could not collect metric {metric_name}: {e}")
                     continue
             
+            # correlation_categories: type-aware — Aurora metrics differ from RDS
+            if db_type == 'aurora_cluster':
+                correlation_categories = {
+                    'performance': ['ACUUtilization', 'CPUUtilization', 'DBLoad', 'DBLoadCPU', 'DBLoadNonCPU'],
+                    'memory': ['FreeableMemory', 'SwapUsage'],
+                    'io': ['ReadIOPS', 'WriteIOPS', 'ReadLatency', 'WriteLatency',
+                           'ReadThroughput', 'WriteThroughput', 'DiskQueueDepth'],
+                    'connections': ['DatabaseConnections', 'Deadlocks'],
+                    'replication': ['AuroraReplicaLag', 'AuroraReplicaLagMaximum', 'AuroraReplicaLagMinimum'],
+                    'cache': ['BufferCacheHitRatio'],
+                    'transactions': ['CommitLatency', 'CommitThroughput', 'MaximumUsedTransactionIDs'],
+                    'storage': ['VolumeBytesUsed', 'TransactionLogsDiskUsage', 'ReplicationSlotDiskUsage'],
+                    'network': ['NetworkReceiveThroughput', 'NetworkTransmitThroughput', 'NetworkThroughput'],
+                }
+            else:
+                # RDS standalone and RDS Multi-AZ DB Cluster
+                correlation_categories = {
+                    'performance': ['CPUUtilization'],
+                    'memory': ['FreeableMemory'],
+                    'io': ['ReadIOPS', 'WriteIOPS', 'ReadLatency', 'WriteLatency',
+                           'ReadThroughput', 'WriteThroughput', 'CheckpointLag'],
+                    'connections': ['DatabaseConnections'],
+                    'replication': ['ReplicaLag', 'OldestReplicationSlotLag', 'ReplicationSlotDiskUsage'],
+                    'transactions': ['MaximumUsedTransactionIDs', 'TransactionLogsDiskUsage',
+                                     'TransactionLogsGeneration'],
+                    'network': ['NetworkReceiveThroughput', 'NetworkTransmitThroughput'],
+                }
+
             return {
                 'collection_period': {
                     'start_time': start_time.isoformat(),
@@ -406,17 +512,7 @@ class NonInvasiveCollector:
                     'days': days
                 },
                 'metrics': metrics_data,
-                'correlation_categories': {
-                    'performance': ['ACUUtilization', 'CPUUtilization', 'DBLoad', 'DBLoadCPU', 'DBLoadNonCPU'],
-                    'memory': ['FreeableMemory', 'SwapUsage'],
-                    'io': ['ReadIOPS', 'WriteIOPS', 'ReadLatency', 'WriteLatency', 'ReadThroughput', 'WriteThroughput', 'DiskQueueDepth'],
-                    'connections': ['DatabaseConnections', 'Deadlocks'],
-                    'replication': ['AuroraReplicaLag', 'AuroraReplicaLagMaximum', 'AuroraReplicaLagMinimum'],
-                    'cache': ['BufferCacheHitRatio'],
-                    'transactions': ['CommitLatency', 'CommitThroughput', 'MaximumUsedTransactionIDs'],
-                    'storage': ['VolumeBytesUsed', 'TransactionLogsDiskUsage', 'ReplicationSlotDiskUsage'],
-                    'network': ['NetworkReceiveThroughput', 'NetworkTransmitThroughput', 'NetworkThroughput']
-                }
+                'correlation_categories': correlation_categories,
             }
             
         except ClientError as e:
@@ -431,7 +527,10 @@ class NonInvasiveCollector:
             self.logger.info(f"Collecting Performance Insights data for {db_type}: {db_id}")
             
             # Get instances to find PI-enabled ones
-            if db_type == 'aurora_cluster':
+            if db_type in ('aurora_cluster', 'rds_multiaz_cluster'):
+                # Both cluster types: enumerate member instances via DBClusterIdentifier filter.
+                # For rds_multiaz_cluster this correctly finds all 3 nodes by cluster ID,
+                # avoiding the describe_db_instances(cluster_id) call which fails for MZ clusters.
                 paginator = self.rds_client.get_paginator('describe_db_instances')
                 pi_instances = [
                     instance
@@ -773,7 +872,7 @@ def main():
     
     # Single database options
     parser.add_argument('--database-id', help='Specific database identifier (cluster or instance)')
-    parser.add_argument('--database-type', choices=['aurora_cluster', 'rds_instance'], 
+    parser.add_argument('--database-type', choices=['aurora_cluster', 'rds_instance', 'rds_multiaz_cluster'],
                        help='Type of database (required with --database-id)')
     
     # Fleet options
@@ -864,7 +963,11 @@ def main():
             database_info = {
                 'identifier': args.database_id,
                 'type': args.database_type,
-                'wal_framework': 'AuroraPostgreSQL_CustomLens_v1.json' if args.database_type == 'aurora_cluster' else 'RDS_PostgreSQL_CustomLens_v1.json'
+                'wal_framework': (
+                    'AuroraPostgreSQL_CustomLens_v1.json'
+                    if args.database_type == 'aurora_cluster'
+                    else 'RDS_PostgreSQL_CustomLens_v1.json'
+                )
             }
             
             collector.collect_database_data(database_info)

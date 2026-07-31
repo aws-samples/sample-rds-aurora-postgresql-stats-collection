@@ -9,8 +9,12 @@ Parameters:
     Description: EC2 instance type (t3.medium sufficient for data collection only)
   
   KeyPairName:
-    Type: AWS::EC2::KeyPair::KeyName
-    Description: EC2 Key Pair for SSH access
+    Type: String
+    Default: ''
+    Description: >
+      EC2 Key Pair name for SSH access. Optional when using --no-public-ip
+      (SSM Session Manager access only — no SSH needed).
+      Required when AssignPublicIP is true.
   
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -29,7 +33,10 @@ Parameters:
   
   AllowedCIDR:
     Type: String
-    Description: CIDR block allowed for SSH access (0.0.0.0/0 not permitted — use your office or VPN CIDR)
+    Default: '127.0.0.1/32'
+    Description: >
+      CIDR block allowed for SSH access (0.0.0.0/0 not permitted).
+      Not required when using --no-public-ip (defaults to 127.0.0.1/32 as a no-op placeholder).
     AllowedPattern: ^(?!0\.0\.0\.0/0$)([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$
     ConstraintDescription: Must be a valid IP CIDR range (x.x.x.x/x). 0.0.0.0/0 is not allowed for SSH access.
   
@@ -70,11 +77,26 @@ Parameters:
     AllowedValues: ['true', 'false']
     Description: Assign a public IP to the EC2 instance. Set to false for private subnet + SSM access (recommended).
 
+  CreateSSMEndpoints:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Create VPC Interface Endpoints for SSM, SSMMessages, and EC2Messages.
+      Only required when using --no-public-ip in a VPC that does not already have
+      these endpoints. Set to true to create them; set to false (default) if they
+      already exist — the deploy script will reuse them automatically.
+      Cost: ~$0.03/hour ($0.01 per endpoint per AZ) while the stack exists.
+
 Conditions:
   HasSADataBucket: !Not [!Equals [!Ref SADataBucket, '']]
   NeedToCreateBucket: !Equals [!Ref SADataBucket, '']
   HasCodeSourceBucket: !Not [!Equals [!Ref CodeSourceBucket, '']]
   IsPublicIP: !Equals [!Ref AssignPublicIP, 'true']
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  NeedSSMEndpoints: !And
+    - !Equals [!Ref AssignPublicIP, 'false']
+    - !Equals [!Ref CreateSSMEndpoints, 'true']
 
 Resources:
   # S3 Bucket for data sharing with SA
@@ -289,7 +311,7 @@ Resources:
     Properties:
       ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
       InstanceType: !Ref InstanceType
-      KeyName: !Ref KeyPairName
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
       IamInstanceProfile: !Ref CustomerDataCollectionInstanceProfile
       NetworkInterfaces:
         - DeviceIndex: '0'
@@ -505,13 +527,13 @@ Resources:
           Value: Production
     CreationPolicy:
       ResourceSignal:
-        Timeout: PT15M
+        Timeout: PT25M
 
   # CloudWatch Log Group
   CustomerDataCollectionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /aws/ec2/db-stats-collection
+      LogGroupName: !Sub '/aws/ec2/db-stats-collection/${AWS::StackName}'
       RetentionInDays: 30
       # W84/CKV_AWS_158: KMS encryption omitted intentionally — this log group contains
       # only EC2 UserData bootstrap output (package installs, git clone status).
@@ -519,16 +541,74 @@ Resources:
       # pre-create a KMS key and grant CloudWatch Logs access, adding deployment
       # complexity disproportionate to the risk for a short-lived (30-day) bootstrap log.
 
+  # ── VPC Interface Endpoints for SSM Session Manager (--no-public-ip mode) ──
+  # Created only when AssignPublicIP=false AND CreateSSMEndpoints=true.
+  # Skip if the VPC already has these endpoints — the deploy script reuses them.
+  # Allow instance to reach VPC endpoints on TCP/443 (self-referencing rule)
+  # Only needed when CFN creates the endpoints (Pattern B) — endpoint SG = instance SG
+  SSMEndpointIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: NeedSSMEndpoints
+    Properties:
+      GroupId: !Ref CustomerDataCollectionSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref CustomerDataCollectionSecurityGroup
+      Description: Allow SSM agent to reach VPC endpoints (self-referencing for Pattern B)
+
+  SSMInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedSSMEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SSMMessagesInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedSSMEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
+  EC2MessagesInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: NeedSSMEndpoints
+    Properties:
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref SubnetId]
+      SecurityGroupIds: [!Ref CustomerDataCollectionSecurityGroup]
+      PrivateDnsEnabled: true
+
 Outputs:
   InstanceId:
     Description: Instance ID of the Customer Data Collection EC2 instance
     Value: !Ref CustomerDataCollectionInstance
     Export:
       Name: !Sub '${AWS::StackName}-InstanceId'
+
+  InstanceSecurityGroup:
+    Description: Security group ID of the EC2 instance (needed to configure pre-existing SSM VPC endpoints)
+    Value: !Ref CustomerDataCollectionSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceSecurityGroup'
   
   PublicIP:
-    Description: Public IP address of the Customer Data Collection EC2 instance
-    Value: !GetAtt CustomerDataCollectionInstance.PublicIp
+    Description: Public IP address of the Customer Data Collection EC2 instance (empty when --no-public-ip)
+    Value: !If
+      - IsPublicIP
+      - !GetAtt CustomerDataCollectionInstance.PublicIp
+      - 'N/A - Private subnet deployment (use SSM)'
     Export:
       Name: !Sub '${AWS::StackName}-PublicIP'
   
@@ -548,7 +628,10 @@ Outputs:
     Description: Command to connect to the instance
     Value: !If
       - IsPublicIP
-      - !Sub 'ssh -i ${KeyPairName}.pem ec2-user@${CustomerDataCollectionInstance.PublicIp}'
+      - !Sub
+        - 'ssh -i ${KP}.pem ec2-user@${IP}'
+        - KP: !Ref KeyPairName
+          IP: !GetAtt CustomerDataCollectionInstance.PublicIp
       - !Sub 'aws ssm start-session --target ${CustomerDataCollectionInstance} --region ${AWS::Region}'
   
   DataCollectionCommand:
