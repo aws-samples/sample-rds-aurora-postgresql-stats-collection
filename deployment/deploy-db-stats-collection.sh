@@ -344,7 +344,7 @@ if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]] && [[ "${CREATE_SSM_ENDPOINTS:-f
                           "Name=vpc-id,Values=${VPC_ID}" \
                           "Name=vpc-endpoint-state,Values=available" \
                 --query 'VpcEndpoints[0].VpcEndpointId' \
-                --output text 2>/dev/null)
+                --output text 2>/dev/null || true)
 
             if [ -z "$ENDPOINT_ID" ] || [ "$ENDPOINT_ID" == "None" ]; then
                 echo "   ⚠️  No existing $SVC endpoint found in $VPC_ID."
@@ -355,7 +355,7 @@ if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]] && [[ "${CREATE_SSM_ENDPOINTS:-f
             # Add subnet if not already present
             EXISTING_SUBNETS=$(aws ec2 describe-vpc-endpoints \
                 --vpc-endpoint-ids "$ENDPOINT_ID" --region "$REGION" \
-                --query 'VpcEndpoints[0].SubnetIds' --output text 2>/dev/null)
+                --query 'VpcEndpoints[0].SubnetIds' --output text 2>/dev/null || true)
             if echo "$EXISTING_SUBNETS" | grep -qw "$SUBNET_ID"; then
                 echo "   ✅ $SVC ($ENDPOINT_ID): subnet already present"
             else
@@ -370,7 +370,7 @@ if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]] && [[ "${CREATE_SSM_ENDPOINTS:-f
             # Add instance SG to endpoint's inbound rules if not already present
             ENDPOINT_SG=$(aws ec2 describe-vpc-endpoints \
                 --vpc-endpoint-ids "$ENDPOINT_ID" --region "$REGION" \
-                --query 'VpcEndpoints[0].Groups[0].GroupId' --output text 2>/dev/null)
+                --query 'VpcEndpoints[0].Groups[0].GroupId' --output text 2>/dev/null || true)
             if [ -n "$ENDPOINT_SG" ] && [ "$ENDPOINT_SG" != "None" ]; then
                 # Check if rule already exists
                 RULE_EXISTS=$(aws ec2 describe-security-group-rules \
@@ -378,7 +378,7 @@ if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]] && [[ "${CREATE_SSM_ENDPOINTS:-f
                               "Name=referenced-group-id,Values=${INSTANCE_SG}" \
                     --region "$REGION" \
                     --query 'SecurityGroupRules[?FromPort==`443`].SecurityGroupRuleId' \
-                    --output text 2>/dev/null)
+                    --output text 2>/dev/null || true)
                 if [ -n "$RULE_EXISTS" ] && [ "$RULE_EXISTS" != "None" ]; then
                     echo "   ✅ $SVC endpoint SG: inbound rule already exists"
                 else
