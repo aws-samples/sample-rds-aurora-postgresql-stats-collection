@@ -7,7 +7,8 @@
 ## What this does
 
 Deploys a lightweight EC2 instance in your AWS account that:
-- Discovers all PostgreSQL databases (Aurora and RDS) in your account/region
+
+- Discovers all PostgreSQL databases (Aurora PostgreSQL, RDS for PostgreSQL, and RDS Multi-AZ DB Clusters for PostgreSQL) in your account/region
 - Collects [CloudWatch metrics](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.AuroraMonitoring.Metrics.html), [Performance Insights](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/USER_DatabaseInsights.html) data, and database configuration
 - Collects deeper database statistics — query performance (`pg_stat_statements`), table/index bloat, health insights, and workload trends via [PGPerfStatsSnapper](https://github.com/aws-samples/aurora-and-database-migration-labs/tree/master/Code/PGPerfStatsSnapper) (requires [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html) to access DB from your account)
 - Generates interactive HTML reports for visual exploration of collected metrics
@@ -16,9 +17,9 @@ Deploys a lightweight EC2 instance in your AWS account that:
 ## Prerequisites
 
 - AWS CLI configured with your account credentials
-- An EC2 Key Pair in your target region
-- A VPC with a public subnet
+- A VPC with a subnet (public or private — see deployment options below)
 - IAM permissions: EC2, CloudFormation, S3, RDS, CloudWatch, Performance Insights
+- An EC2 Key Pair — required only for **public subnet** deployments (SSH access). Not needed for `--no-public-ip` deployments.
 
 ### Network ACL (NACL) requirements
 
@@ -36,7 +37,7 @@ If the subnet you deploy into has a custom [Network ACL](https://docs.aws.amazon
 
 | Port | Protocol | Source | Purpose |
 |------|----------|--------|---------|
-| 22 | TCP | Your IP/32 | SSH access |
+| 22 | TCP | Your IP/32 | SSH access (public subnet only) |
 | 1024–65535 | TCP | 0.0.0.0/0 | Ephemeral ports — return traffic for outbound HTTPS and PostgreSQL connections |
 
 > **Note**: The default VPC NACL allows all traffic in both directions — no changes needed if you are using the default NACL. Custom NACLs that deny ephemeral port return traffic are the most common cause of silent connectivity failures (instance appears to deploy successfully but `dnf`, `git clone`, and AWS API calls hang or time out).
@@ -49,20 +50,41 @@ Clone the repository and run the deploy script:
 git clone https://github.com/aws-samples/sample-rds-aurora-postgresql-stats-collection.git
 cd sample-rds-aurora-postgresql-stats-collection
 
+# Option 1: Public subnet (SSH access)
 bash deployment/deploy-db-stats-collection.sh \
   --key-pair <your-key-pair-name> \
   --vpc-id <your-vpc-id> \
   --subnet-id <your-public-subnet-id> \
   --allowed-cidr <your-ip>/32 \
+  --region <your-region>
+  --db-port 5432          # optional: only needed if your RDS/Aurora endpoint uses a non-standard port
+
+# Option 2: Private subnet with NAT Gateway (SSM access, no SSH)
+bash deployment/deploy-db-stats-collection.sh \
+  --no-public-ip \
+  --vpc-id <your-vpc-id> \
+  --subnet-id <your-private-subnet-id> \
+  --region <your-region> \
+  --db-port 5432          # optional: only needed if your RDS/Aurora endpoint uses a non-standard port
+
+# Option 3: Private subnet with NAT Gateway — CFN creates SSM VPC endpoints to keep SSM traffic off the public internet
+bash deployment/deploy-db-stats-collection.sh \
+  --no-public-ip \
+  --create-ssm-endpoints \
+  --vpc-id <your-vpc-id> \
+  --subnet-id <your-private-subnet-id> \
   --region <your-region> \
   --db-port 5432          # optional: only needed if your RDS/Aurora endpoint uses a non-standard port
 ```
 
 The script will:
+
 1. Package the repo contents and upload to S3 (fallback if the EC2 instance can't reach GitHub)
 2. Deploy a CloudFormation stack (`wal-db-stats-collection`) with a `t3.medium` EC2 instance
 3. The EC2 instance clones the repo from GitHub on boot (falls back to S3 if GitHub is unreachable)
-4. Print the SSH command, instance IP, and data S3 bucket name on completion
+4. Print the instance ID, IP, SSM connect command, and data S3 bucket name on completion
+
+> **Note**: In a private subnet with a NAT Gateway, [AWS Systems Manager Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/what-is-systems-manager.html) works automatically via NAT — no VPC endpoints are required. It requires outbound connectivity to `ssm`, `ssmmessages`, and `ec2messages` endpoints for keeping SSM traffic off the public internet. If your VPC already has SSM VPC endpoints, the deploy script automatically adds the instance subnet and security group to them. Use `--create-ssm-endpoints` if you want SSM traffic to stay within the AWS network (off the public internet) — CloudFormation will create the three required Interface VPC Endpoints scoped to the deployment subnet.
 
 Wait ~10 minutes for the instance to finish setup after the stack completes.
 
@@ -70,11 +92,12 @@ Wait ~10 minutes for the instance to finish setup after the stack completes.
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `--key-pair` | Yes | — | EC2 Key Pair name for SSH access |
+| `--key-pair` | Conditional | — | EC2 Key Pair name for SSH access. Required when deploying into a **public subnet**. Not required with `--no-public-ip`. |
 | `--vpc-id` | Yes | — | VPC ID where the EC2 instance will be deployed. **Must be the same VPC as your RDS/Aurora cluster** so the instance can reach the database endpoint. |
 | `--subnet-id` | Yes | — | Subnet ID within the VPC above. Two options: **(1) Public subnet** (with an Internet Gateway) — instance gets a public IP, SSH works directly from your machine. **(2) Private subnet with a [NAT Gateway](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html)** — SSH is not possible without a bastion or VPN. Outbound traffic routes via NAT for S3 uploads and package installation. Use [AWS Systems Manager Session Manager](#accessing-the-instance-in-a-private-subnet) to connect. |
-| `--allowed-cidr` | Yes | — | CIDR allowed for SSH inbound on port 22. **Must be your specific IP** (e.g. `203.0.113.42/32`). `0.0.0.0/0` is rejected — open SSH access is a security risk. Find your IP with `curl -s ifconfig.me`. |
-| `--no-public-ip` | No | — | Deploy without a public IP address. Use when deploying into a private subnet with a NAT Gateway. SSH is not available; connect via [AWS Systems Manager Session Manager](#accessing-the-instance-in-a-private-subnet). When set, `--allowed-cidr` is not required. |
+| `--allowed-cidr` | Conditional | — | CIDR allowed for SSH inbound on port 22. **Must be your specific IP** (e.g. `203.0.113.42/32`). `0.0.0.0/0` is rejected — open SSH access is a security risk. Find your IP with `curl -s ifconfig.me`. Required when using a public subnet. Not required with `--no-public-ip`. |
+| `--no-public-ip` | No | — | Deploy without a public IP address. Use when deploying into a **private subnet with a NAT Gateway**. SSH is not available; connect via [AWS Systems Manager Session Manager](#accessing-the-instance-in-a-private-subnet). When set, `--key-pair` and `--allowed-cidr` are not required. The deploy script automatically configures pre-existing SSM VPC endpoints if present. |
+| `--create-ssm-endpoints` | No | — | Use with `--no-public-ip` when the VPC has **no existing SSM VPC endpoints**. Creates three Interface VPC Endpoints (`ssm`, `ssmmessages`, `ec2messages`) as part of the CloudFormation stack, enabling Session Manager connectivity via VPC endpoints rather than via NAT. A NAT Gateway is still required for bootstrap and S3 uploads. See [SSM VPC endpoint options](#ssm-vpc-endpoint-options-for-no-public-ip-deployments) below. |
 | `--db-port` | No | `5432` | PostgreSQL port on your RDS/Aurora endpoint. Only needed for invasive collection if your database uses a non-standard port. Drives the outbound security group egress rule. |
 | `--region` | No | `us-east-1` | AWS region to deploy into |
 | `--instance-type` | No | `t3.medium` | EC2 instance type |
@@ -95,13 +118,21 @@ ssh -i <your-key-pair>.pem ec2-user@<instance-ip>
 
 If you deploy into a private subnet (no public IP), SSH from your machine won't reach the instance. Use **AWS Systems Manager Session Manager** instead — no open inbound ports, no bastion host required.
 
-> **Note**: Session Manager requires the instance to reach the SSM endpoints. In a private subnet with a NAT Gateway this works automatically via the NAT outbound route.
+> **Note**: The EC2 instance role already includes the `AmazonSSMManagedInstanceCore` policy, so SSM is enabled automatically.
 
-The EC2 instance role already includes the `AmazonSSMManagedInstanceCore` policy, so SSM is enabled automatically.
+**Connecting via Session Manager**
 
-**AWS Console**
+**AWS Console:**
+
 1. Open the [EC2 console](https://console.aws.amazon.com/ec2/) → Instances
 2. Select the instance → Connect → Session Manager → Connect
+
+**AWS CLI:**
+```bash
+aws ssm start-session --target <instance-id> --region <your-region>
+```
+
+The deploy script prints the exact SSM command in the stack outputs after deployment.
 
 ## Step 3: Run database statistics and metrics collection 
 
@@ -128,8 +159,8 @@ cd /home/ec2-user/wal-db-stats-collection
 
 | Argument | Required | Description |
 |----------|----------|-------------|
-| `cluster-id` | Yes | RDS cluster or instance identifier |
-| `db-host` | Yes | Database endpoint hostname |
+| `cluster-id` | Yes | RDS cluster or instance identifier. For RDS Multi-AZ DB Clusters, use the cluster identifier (e.g. `my-maz-cluster`). |
+| `db-host` | Yes | Database endpoint hostname. For Aurora and RDS Multi-AZ DB Clusters, use the **writer endpoint** to capture write workload, `pg_stat_statements`, and PGSnapper snapshots from the primary. For RDS Multi-AZ DB Clusters, this is the cluster-level writer endpoint. |
 | `db-user` | Yes | Database username |
 | `db-secret-arn` | Yes | Secrets Manager ARN containing the DB password |
 | `db-name` | No | Database name to connect to (default: `postgres`) |
@@ -278,15 +309,80 @@ To **skip redaction** (e.g. for internal analysis where you need raw endpoints):
 To remove all deployed resources:
 
 ```bash
-# Delete the CloudFormation stack (terminates EC2 instance, removes IAM roles/SGs)
+# Delete the CloudFormation stack (terminates EC2 instance, removes IAM roles, SGs, and any SSM VPC endpoints created by the stack)
 aws cloudformation delete-stack \
   --stack-name wal-db-stats-collection \
   --region <your-region>
 
-# Optionally delete the S3 buckets
-aws s3 rb s3://wal-db-stats-collection-<account-id> --force
-aws s3 rb s3://wal-db-stats-code-<account-id> --force
+# Wait for deletion to complete
+aws cloudformation wait stack-delete-complete \
+  --stack-name wal-db-stats-collection \
+  --region <your-region>
+
+# Optionally delete the S3 data bucket (contains collected metrics — delete after SA review is complete)
+# Step 1: Remove all versioned objects and delete markers (required if bucket has versioning enabled)
+aws s3api delete-objects \
+  --bucket wal-db-stats-collection-<account-id> \
+  --region <your-region> \
+  --delete "$(aws s3api list-object-versions \
+    --bucket wal-db-stats-collection-<account-id> \
+    --region <your-region> \
+    --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
+    --output json)"
+
+# Step 2: Remove delete markers
+aws s3api delete-objects \
+  --bucket wal-db-stats-collection-<account-id> \
+  --region <your-region> \
+  --delete "$(aws s3api list-object-versions \
+    --bucket wal-db-stats-collection-<account-id> \
+    --region <your-region> \
+    --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
+    --output json)"
+
+# Step 3: Delete the bucket
+aws s3 rb s3://wal-db-stats-collection-<account-id> --region <your-region>
 ```
+
+> **Note**: The temporary code bucket (`wal-db-stats-code-<account-id>`) is automatically deleted by the deploy script after stack creation completes. If it was not cleaned up automatically, delete it manually: `aws s3 rb s3://wal-db-stats-code-<account-id> --force --region <your-region>`
+
+> **Note**: If you created a NAT Gateway, EIP, private subnet, or route table outside of CloudFormation for this deployment, those resources must be deleted manually — they are not managed by the stack.
+
+## Cost Estimation
+
+All resources are deployed into your AWS account. Costs depend on how long you leave the stack running. The following estimates are based on **us-east-1** On-Demand pricing for a **1-day** collection run.
+
+| Resource | Rate | Typical usage (1 day) | Estimated cost |
+|----------|------|----------------------|----------------|
+| EC2 t3.medium | $0.0416/hr | 24 hrs | ~$1.00 |
+| S3 storage | $0.023/GB-month | <100 MB of metrics data | <$0.01 |
+| S3 requests | $0.005/1K PUT | ~50 files uploaded | <$0.01 |
+| CloudWatch API | $0.01/1K metrics | ~1,000 metric queries | ~$0.01 |
+| Performance Insights — 7-day retention | Free | Included with RDS/Aurora | $0 |
+| Performance Insights — API calls | $0.01/1K calls | ~400 API calls per run | <$0.01 |
+| **SSM VPC endpoints** (Option 3 only) | $0.01/hr × 3 endpoints | 24 hrs | ~$0.72 |
+| **NAT Gateway** (if created for this deployment) | $0.045/hr + $0.045/GB | 24 hrs + ~1 GB data | ~$1.13 |
+
+**Estimated total cost per day:**
+
+| Deployment option | Cost/day |
+|---|---|
+| Option 1 — public subnet | ~$1.00–$1.05 |
+| Option 2 — private subnet + NAT (NAT pre-existing) | ~$1.00–$1.05 |
+| Option 2 — private subnet + NAT (NAT created for this) | ~$2.13–$2.18 |
+| Option 3 — private subnet + NAT + SSM endpoints | ~$1.72–$1.77 (NAT pre-existing) |
+
+> **Note**: To minimize cost, delete the stack as soon as the SA has confirmed receipt of the data. The S3 data bucket has a 30-day lifecycle expiry — objects are deleted automatically.
+
+## What's New
+
+### v2.0
+
+- **RDS Multi-AZ DB Cluster support** — fleet discovery, non-invasive collection (CloudWatch from writer, Performance Insights from all 3 instances), and correct WAL lens selection for RDS Multi-AZ DB Clusters
+- **Private subnet deployment** (`--no-public-ip`) — deploy without a public IP or SSH key pair; connect via SSM Session Manager. Key pair and CIDR are no longer required
+- **SSM VPC endpoint automation** — deploy script auto-configures pre-existing SSM endpoints (Pattern A); `--create-ssm-endpoints` flag has CFN create them when none exist (Pattern B)
+- **Code bucket security** — public access blocked and server-side encryption enabled at creation; bucket deleted automatically after stack creation
+- **Stack-scoped log group** — prevents CloudWatch log group conflicts between multiple stacks
 
 ## Troubleshooting
 
