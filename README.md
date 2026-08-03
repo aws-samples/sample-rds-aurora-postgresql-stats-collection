@@ -309,7 +309,48 @@ To **skip redaction** (e.g. for internal analysis where you need raw endpoints):
 To remove all deployed resources:
 
 ```bash
-# Delete the CloudFormation stack (terminates EC2 instance, removes IAM roles, SGs, and any SSM VPC endpoints created by the stack)
+# Step 0: Pre-deletion prerequisites (complete before running Step 1)
+
+# If you deployed with --no-public-ip (without --create-ssm-endpoints), the deploy script added an inbound rule to your VPC's existing SSM endpoints referencing the stack's instance security group. CFN cannot remove this external reference automatically, so you must revoke it manually before deleting the stack — otherwise the deletion will fail.
+INSTANCE_SG=$(aws cloudformation describe-stacks \
+  --stack-name wal-db-stats-collection --region <your-region> \
+  --query 'Stacks[0].Outputs[?OutputKey==`InstanceSecurityGroup`].OutputValue' \
+  --output text)
+
+# Find all security groups in the VPC that reference the instance SG and revoke those rules
+REFERENCING_SGS=$(aws ec2 describe-security-groups --region <your-region> \
+  --filters "Name=vpc-id,Values=<your-vpc-id>" \
+  --query "SecurityGroups[?IpPermissions[?UserIdGroupPairs[?GroupId=='${INSTANCE_SG}']]].GroupId" \
+  --output text)
+
+if [ -z "$REFERENCING_SGS" ] || [ "$REFERENCING_SGS" = "None" ]; then
+  echo "  No external SG references found — safe to delete stack"
+else
+  for SG_ID in $REFERENCING_SGS; do
+    aws ec2 revoke-security-group-ingress \
+      --group-id "$SG_ID" --protocol tcp --port 443 \
+      --source-group "$INSTANCE_SG" --region <your-region> > /dev/null \
+      && echo "  Revoked rule in $SG_ID" || echo "  $SG_ID: could not revoke"
+  done
+fi
+
+# The S3 data bucket (wal-db-stats-collection-<account-id>) contains collected metrics.
+# The stack deletion will fail if the bucket is non-empty. You can choose to retain the
+# bucket (objects expire automatically after 30 days) and retry the stack deletion again,
+# or if you want to delete the bucket along with the stack, empty it first using the
+# commands below before running Step 1.
+
+# Remove all versioned objects and delete markers
+OBJECTS=$(aws s3api list-object-versions \
+  --bucket wal-db-stats-collection-<account-id> --region <your-region> \
+  --output json \
+  --query '{Objects: [Versions,DeleteMarkers][][].{Key:Key,VersionId:VersionId}}')
+echo "$OBJECTS" | grep -q '"Key"' && \
+  aws s3api delete-objects \
+    --bucket wal-db-stats-collection-<account-id> --region <your-region> \
+    --delete "$OBJECTS" || echo "Bucket already empty"
+
+# Step 1: Delete the CloudFormation stack
 aws cloudformation delete-stack \
   --stack-name wal-db-stats-collection \
   --region <your-region>
@@ -318,30 +359,6 @@ aws cloudformation delete-stack \
 aws cloudformation wait stack-delete-complete \
   --stack-name wal-db-stats-collection \
   --region <your-region>
-
-# Optionally delete the S3 data bucket (contains collected metrics — delete after SA review is complete)
-# Step 1: Remove all versioned objects and delete markers (required if bucket has versioning enabled)
-aws s3api delete-objects \
-  --bucket wal-db-stats-collection-<account-id> \
-  --region <your-region> \
-  --delete "$(aws s3api list-object-versions \
-    --bucket wal-db-stats-collection-<account-id> \
-    --region <your-region> \
-    --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}' \
-    --output json)"
-
-# Step 2: Remove delete markers
-aws s3api delete-objects \
-  --bucket wal-db-stats-collection-<account-id> \
-  --region <your-region> \
-  --delete "$(aws s3api list-object-versions \
-    --bucket wal-db-stats-collection-<account-id> \
-    --region <your-region> \
-    --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}' \
-    --output json)"
-
-# Step 3: Delete the bucket
-aws s3 rb s3://wal-db-stats-collection-<account-id> --region <your-region>
 ```
 
 > **Note**: The temporary code bucket (`wal-db-stats-code-<account-id>`) is automatically deleted by the deploy script after stack creation completes. If it was not cleaned up automatically, delete it manually: `aws s3 rb s3://wal-db-stats-code-<account-id> --force --region <your-region>`
