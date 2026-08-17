@@ -10,37 +10,63 @@ Deploys a lightweight EC2 instance in your AWS account that:
 
 - Discovers all PostgreSQL databases (Aurora PostgreSQL, RDS for PostgreSQL, and RDS Multi-AZ DB Clusters for PostgreSQL) in your account/region
 - Collects [CloudWatch metrics](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.AuroraMonitoring.Metrics.html), [Performance Insights](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/USER_DatabaseInsights.html) data, and database configuration
-- Collects deeper database statistics — query performance (`pg_stat_statements`), table/index bloat, health insights, and workload trends via [PGPerfStatsSnapper](https://github.com/aws-samples/aurora-and-database-migration-labs/tree/master/Code/PGPerfStatsSnapper) (requires [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html) to access DB from your account)
+- Collects deeper database statistics - query performance (`pg_stat_statements`), table/index bloat, health insights, and workload trends via [PGPerfStatsSnapper](https://github.com/aws-samples/aurora-and-database-migration-labs/tree/master/Code/PGPerfStatsSnapper) (requires [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html) to access DB from your account)
 - Generates interactive HTML reports for visual exploration of collected metrics
 - Uploads collected data to an S3 bucket in your account for review
+
+## Architecture
+
+```
+                    ┌──────────────────────────────────────────────────────────────┐
+                    │  Customer AWS Account                                        │
+                    │                                                              │
+  ┌──────────────┐  │  ┌──────────────────────────────┐   ┌──────────────────────┐ │
+  │ SA           │  │  │ EC2 (t3.medium)              │──►│ RDS/Aurora           │ │
+  │ (analysis)   │  │  │                              │   │ PostgreSQL           │ │
+  └──────┬───────┘  │  │ Installed:                   │   │                      │ │
+         │          │  │  - Python 3.11               │   │  - pg_stat_          │ │
+         │          │  │  - PostgreSQL 15 client      │   │    statements        │ │
+         │◄─────────┼──│  - PGPerfStatsSnapper        │   │  - Database Insights │ │
+          share     │  │  - Local PostgreSQL DB       │   └──────────────────────┘ │
+                    │  │    (PGSnapper analysis)      │                            │
+                    │  │                              │   ┌──────────────────────┐ │
+                    │  │ Collects:                    │──►│ S3 (data bucket)     │ │
+                    │  │  - CloudWatch metrics        │   └──────────────────────┘ │
+                    │  │  - Database Insights         │                            │
+                    │  │  - DB statistics             │                            │
+                    │  └──────────────────────────────┘                            │
+                    └──────────────────────────────────────────────────────────────┘
+```
+
+> **Note**: The EC2 instance runs a local PostgreSQL instance used exclusively by PGPerfStatsSnapper to load and analyze the periodic performance statistics it collects from the RDS/Aurora database. It is used as a temporary analysis engine and all results are written to the S3 data bucket.
 
 ## Prerequisites
 
 - AWS CLI configured with your account credentials
-- A VPC with a subnet (public or private — see deployment options below)
+- A VPC with a subnet (public or private - see deployment options below)
 - IAM permissions: EC2, CloudFormation, S3, RDS, CloudWatch, Performance Insights
-- An EC2 Key Pair — required only for **public subnet** deployments (SSH access). Not needed for `--no-public-ip` deployments.
+- An EC2 Key Pair - required only for **public subnet** deployments (SSH access). Not needed for `--no-public-ip` deployments.
 
 ### Network ACL (NACL) requirements
 
-If the subnet you deploy into has a custom [Network ACL](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-network-acls.html) (non-default), verify the following rules are present **before deploying**. Unlike Security Groups, NACLs are stateless — return traffic must be explicitly allowed.
+If the subnet you deploy into has a custom [Network ACL](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-network-acls.html) (non-default), verify the following rules are present **before deploying**. Unlike Security Groups, NACLs are stateless - return traffic must be explicitly allowed.
 
 **Outbound NACL rules required:**
 
 | Port | Protocol | Destination | Purpose |
 |------|----------|-------------|---------|
-| 443 | TCP | 0.0.0.0/0 | HTTPS — AWS APIs, S3, GitHub, package repos, CloudWatch agent |
-| 5432 (or `--db-port` value) | TCP | RDS/Aurora CIDR or 0.0.0.0/0 | PostgreSQL — invasive collection only |
-| 1024–65535 | TCP | 0.0.0.0/0 | Ephemeral ports — return traffic for all outbound connections |
+| 443 | TCP | 0.0.0.0/0 | HTTPS - AWS APIs, S3, GitHub, package repos, CloudWatch agent |
+| 5432 (or `--db-port` value) | TCP | RDS/Aurora CIDR or 0.0.0.0/0 | PostgreSQL - invasive collection only |
+| 1024–65535 | TCP | 0.0.0.0/0 | Ephemeral ports - return traffic for all outbound connections |
 
 **Inbound NACL rules required:**
 
 | Port | Protocol | Source | Purpose |
 |------|----------|--------|---------|
 | 22 | TCP | Your IP/32 | SSH access (public subnet only) |
-| 1024–65535 | TCP | 0.0.0.0/0 | Ephemeral ports — return traffic for outbound HTTPS and PostgreSQL connections |
+| 1024–65535 | TCP | 0.0.0.0/0 | Ephemeral ports - return traffic for outbound HTTPS and PostgreSQL connections |
 
-> **Note**: The default VPC NACL allows all traffic in both directions — no changes needed if you are using the default NACL. Custom NACLs that deny ephemeral port return traffic are the most common cause of silent connectivity failures (instance appears to deploy successfully but `dnf`, `git clone`, and AWS API calls hang or time out).
+> **Note**: The default VPC NACL allows all traffic in both directions - no changes needed if you are using the default NACL. Custom NACLs that deny ephemeral port return traffic are the most common cause of silent connectivity failures (instance appears to deploy successfully but `dnf`, `git clone`, and AWS API calls hang or time out).
 
 ## Step 1: Deploy the data collection instance
 
@@ -67,7 +93,7 @@ bash deployment/deploy-db-stats-collection.sh \
   --region <your-region> \
   --db-port 5432          # optional: only needed if your RDS/Aurora endpoint uses a non-standard port
 
-# Option 3: Private subnet with NAT Gateway — CFN creates SSM VPC endpoints to keep SSM traffic off the public internet
+# Option 3: Private subnet with NAT Gateway - CFN creates SSM VPC endpoints to keep SSM traffic off the public internet
 bash deployment/deploy-db-stats-collection.sh \
   --no-public-ip \
   --create-ssm-endpoints \
@@ -84,7 +110,7 @@ The script will:
 3. The EC2 instance clones the repo from GitHub on boot (falls back to S3 if GitHub is unreachable)
 4. Print the instance ID, IP, SSM connect command, and data S3 bucket name on completion
 
-> **Note**: In a private subnet with a NAT Gateway, [AWS Systems Manager Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/what-is-systems-manager.html) works automatically via NAT — no VPC endpoints are required. It requires outbound connectivity to `ssm`, `ssmmessages`, and `ec2messages` endpoints for keeping SSM traffic off the public internet. If your VPC already has SSM VPC endpoints, the deploy script automatically adds the instance subnet and security group to them. Use `--create-ssm-endpoints` if you want SSM traffic to stay within the AWS network (off the public internet) — CloudFormation will create the three required Interface VPC Endpoints scoped to the deployment subnet.
+> **Note**: In a private subnet with a NAT Gateway, [AWS Systems Manager Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/what-is-systems-manager.html) works automatically via NAT - no VPC endpoints are required. It requires outbound connectivity to `ssm`, `ssmmessages`, and `ec2messages` endpoints for keeping SSM traffic off the public internet. If your VPC already has SSM VPC endpoints, the deploy script automatically adds the instance subnet and security group to them. Use `--create-ssm-endpoints` if you want SSM traffic to stay within the AWS network (off the public internet) - CloudFormation will create the three required Interface VPC Endpoints scoped to the deployment subnet.
 
 Wait ~10 minutes for the instance to finish setup after the stack completes.
 
@@ -92,12 +118,12 @@ Wait ~10 minutes for the instance to finish setup after the stack completes.
 
 | Parameter | Required | Default | Description |
 |-----------|----------|---------|-------------|
-| `--key-pair` | Conditional | — | EC2 Key Pair name for SSH access. Required when deploying into a **public subnet**. Not required with `--no-public-ip`. |
-| `--vpc-id` | Yes | — | VPC ID where the EC2 instance will be deployed. **Must be the same VPC as your RDS/Aurora cluster** so the instance can reach the database endpoint. |
-| `--subnet-id` | Yes | — | Subnet ID within the VPC above. Two options: **(1) Public subnet** (with an Internet Gateway) — instance gets a public IP, SSH works directly from your machine. **(2) Private subnet with a [NAT Gateway](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html)** — SSH is not possible without a bastion or VPN. Outbound traffic routes via NAT for S3 uploads and package installation. Use [AWS Systems Manager Session Manager](#accessing-the-instance-in-a-private-subnet) to connect. |
-| `--allowed-cidr` | Conditional | — | CIDR allowed for SSH inbound on port 22. **Must be your specific IP** (e.g. `203.0.113.42/32`). `0.0.0.0/0` is rejected — open SSH access is a security risk. Find your IP with `curl -s ifconfig.me`. Required when using a public subnet. Not required with `--no-public-ip`. |
-| `--no-public-ip` | No | — | Deploy without a public IP address. Use when deploying into a **private subnet with a NAT Gateway**. SSH is not available; connect via [AWS Systems Manager Session Manager](#accessing-the-instance-in-a-private-subnet). When set, `--key-pair` and `--allowed-cidr` are not required. The deploy script automatically configures pre-existing SSM VPC endpoints if present. |
-| `--create-ssm-endpoints` | No | — | Use with `--no-public-ip` when the VPC has **no existing SSM VPC endpoints**. Creates three Interface VPC Endpoints (`ssm`, `ssmmessages`, `ec2messages`) as part of the CloudFormation stack, enabling Session Manager connectivity via VPC endpoints rather than via NAT. A NAT Gateway is still required for bootstrap and S3 uploads. See [SSM VPC endpoint options](#ssm-vpc-endpoint-options-for-no-public-ip-deployments) below. |
+| `--key-pair` | Conditional | - | EC2 Key Pair name for SSH access. Required when deploying into a **public subnet**. Not required with `--no-public-ip`. |
+| `--vpc-id` | Yes | - | VPC ID where the EC2 instance will be deployed. **Must be the same VPC as your RDS/Aurora cluster** so the instance can reach the database endpoint. |
+| `--subnet-id` | Yes | - | Subnet ID within the VPC above. Two options: **(1) Public subnet** (with an Internet Gateway) - instance gets a public IP, SSH works directly from your machine. **(2) Private subnet with a [NAT Gateway](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-nat-gateway.html)** - SSH is not possible without a bastion or VPN. Outbound traffic routes via NAT for S3 uploads and package installation. Use [AWS Systems Manager Session Manager](#accessing-the-instance-in-a-private-subnet) to connect. |
+| `--allowed-cidr` | Conditional | - | CIDR allowed for SSH inbound on port 22. **Must be your specific IP** (e.g. `203.0.113.42/32`). `0.0.0.0/0` is rejected - open SSH access is a security risk. Find your IP with `curl -s ifconfig.me`. Required when using a public subnet. Not required with `--no-public-ip`. |
+| `--no-public-ip` | No | - | Deploy without a public IP address. Use when deploying into a **private subnet with a NAT Gateway**. SSH is not available; connect via [AWS Systems Manager Session Manager](#accessing-the-instance-in-a-private-subnet). When set, `--key-pair` and `--allowed-cidr` are not required. The deploy script automatically configures pre-existing SSM VPC endpoints if present. |
+| `--create-ssm-endpoints` | No | - | Use with `--no-public-ip` when the VPC has **no existing SSM VPC endpoints**. Creates three Interface VPC Endpoints (`ssm`, `ssmmessages`, `ec2messages`) as part of the CloudFormation stack, enabling Session Manager connectivity via VPC endpoints rather than via NAT. A NAT Gateway is still required for bootstrap and S3 uploads. See [SSM VPC endpoint options](#ssm-vpc-endpoint-options-for-no-public-ip-deployments) below. |
 | `--db-port` | No | `5432` | PostgreSQL port on your RDS/Aurora endpoint. Only needed for invasive collection if your database uses a non-standard port. Drives the outbound security group egress rule. |
 | `--region` | No | `us-east-1` | AWS region to deploy into |
 | `--instance-type` | No | `t3.medium` | EC2 instance type |
@@ -116,7 +142,7 @@ ssh -i <your-key-pair>.pem ec2-user@<instance-ip>
 
 ### Accessing the instance in a private subnet
 
-If you deploy into a private subnet (no public IP), SSH from your machine won't reach the instance. Use **AWS Systems Manager Session Manager** instead — no open inbound ports, no bastion host required.
+If you deploy into a private subnet (no public IP), SSH from your machine won't reach the instance. Use **AWS Systems Manager Session Manager** instead - no open inbound ports, no bastion host required.
 
 > **Note**: The EC2 instance role already includes the `AmazonSSMManagedInstanceCore` policy, so SSM is enabled automatically.
 
@@ -138,11 +164,11 @@ The deploy script prints the exact SSM command in the stack outputs after deploy
 
 Database statistics and metrics collection gathers CloudWatch metrics (7 days), Performance Insights, and RDS/Aurora configuration for all PostgreSQL databases discovered in your account. Additionally, it collects database statistics and query performance data using extension [pg_stat_statements](https://www.postgresql.org/docs/current/pgstatstatements.html) and [PGPerfStatsSnapper](https://github.com/aws-samples/aurora-and-database-migration-labs/blob/master/Code/PGPerfStatsSnapper/README.md) for performance and workload analysis. This requires database credentials stored in AWS Secrets Manager.
 
-> **Note**: Database statistics and metrics collection runs read-only queries against your database. No data is modified. Queries are lightweight and designed to have minimal performance impact. Test with your QA/test environment to understand the metrics collected before running against production. If you have concerns about direct database access, see [(Optional) Collect CloudWatch metrics only](#optional-collect-cloudwatch-metrics-only) — however, skipping in-depth database statistics and metrics collection limits the SA's ability to identify slow queries and top SQL by execution time (`pg_stat_statements`), table-level bloat and sequential scan patterns (`pg_stat_user_tables`), unused and redundant indexes (`pg_stat_user_indexes`), checkpoint and buffer write pressure (`pg_stat_bgwriter`), and historical workload trends from PGPerfStatsSnapper snapshots. These are the primary inputs for Well Architected Review tuning recommendations.
+> **Note**: Database statistics and metrics collection runs read-only queries against your database. No data is modified. Queries are lightweight and designed to have minimal performance impact. Test with your QA/test environment to understand the metrics collected before running against production. If you have concerns about direct database access, see [(Optional) Collect CloudWatch metrics only](#optional-collect-cloudwatch-metrics-only) - however, skipping in-depth database statistics and metrics collection limits the SA's ability to identify slow queries and top SQL by execution time (`pg_stat_statements`), table-level bloat and sequential scan patterns (`pg_stat_user_tables`), unused and redundant indexes (`pg_stat_user_indexes`), checkpoint and buffer write pressure (`pg_stat_bgwriter`), and historical workload trends from PGPerfStatsSnapper snapshots. These are the primary inputs for Well Architected Review tuning recommendations.
 
 ### Step 3.1 Enable database statistics collection
 
-Run `enable-invasive-collection.sh` once per cluster. Each call registers that cluster for invasive collection — you can enable as many clusters as needed before running `collect-and-share.sh`.
+Run `enable-invasive-collection.sh` once per cluster. Each call registers that cluster for invasive collection - you can enable as many clusters as needed before running `collect-and-share.sh`.
 
 ```bash
 cd /home/ec2-user/wal-db-stats-collection
@@ -189,25 +215,25 @@ With the example above (`pgsnapper-min-days=1`, `pgsnapper-interval=60`), wait a
 
 Database statistics and metrics collection requires **two runs** of `./collect-and-share.sh`:
 
-1. **Run 1 (setup only)** — installs the PGSnapper cron job and runs an initial snapshot to verify connectivity. **No data collection happens on this run** — no non-invasive metrics, no database statistics, no schema or query performance data. This keeps Run 1 fast and avoids collecting data that would be stale by Run 2.
-2. **Wait** — allow snapshots to accumulate for at least `pgsnapper-min-days` worth of data.
-3. **Run 2 (collect everything)** — collects **all** data with aligned timestamps: non-invasive metrics (CloudWatch, Performance Insights, configuration) for the entire fleet, plus invasive data (database statistics, schema, query performance, PGSnapper analysis) for flagged clusters. Because both non-invasive and invasive data are collected in the same run, all metrics share the same time window.
+1. **Run 1 (setup only)** - installs the PGSnapper cron job and runs an initial snapshot to verify connectivity. **No data collection happens on this run** - no non-invasive metrics, no database statistics, no schema or query performance data. This keeps Run 1 fast and avoids collecting data that would be stale by Run 2.
+2. **Wait** - allow snapshots to accumulate for at least `pgsnapper-min-days` worth of data.
+3. **Run 2 (collect everything)** - collects **all** data with aligned timestamps: non-invasive metrics (CloudWatch, Performance Insights, configuration) for the entire fleet, plus invasive data (database statistics, schema, query performance, PGSnapper analysis) for flagged clusters. Because both non-invasive and invasive data are collected in the same run, all metrics share the same time window.
 
 ```bash
-# Run 1 — setup only: installs cron, verifies connectivity (no data collection)
+# Run 1 - setup only: installs cron, verifies connectivity (no data collection)
 ./collect-and-share.sh
 
 # Wait for pgsnapper-min-days worth of snapshots...
 
-# Run 2 — collects all data + generates interactive HTML reports
+# Run 2 - collects all data + generates interactive HTML reports
 ./collect-and-share.sh --generate-report --skip-security
 ```
 
-> **Note**: If the initial snapshot fails during Run 1 (bad credentials, network issue, etc.), the cron job will **not** be installed. Fix the underlying issue and re-run `./collect-and-share.sh` — it will detect that setup is still needed and retry.
+> **Note**: If the initial snapshot fails during Run 1 (bad credentials, network issue, etc.), the cron job will **not** be installed. Fix the underlying issue and re-run `./collect-and-share.sh` - it will detect that setup is still needed and retry.
 
 > **Note**: `--skip-security` excludes security-related queries (user roles, privileges, SSL, passwords, RLS, audit config) from the collection. Remove the flag if you want security data collected.
 
-> **Note**: `--generate-report` produces a self-contained interactive HTML report for each database (7 tabs: Configuration, CloudWatch Metrics, Performance Insights, Security, Database Health, Workload Trends, Schema Explorer). Open the `*_report.html` file in any browser — no internet, server, or additional software required.
+> **Note**: `--generate-report` produces a self-contained interactive HTML report for each database (7 tabs: Configuration, CloudWatch Metrics, Performance Insights, Security, Database Health, Workload Trends, Schema Explorer). Open the `*_report.html` file in any browser - no internet, server, or additional software required.
 
 Collected data and reports are uploaded to S3:
 ```
@@ -238,7 +264,7 @@ rm -f data/flags/*.flag
 ./collect-and-share.sh
 ```
 
-> **Note**: Removing the flag file only prevents invasive collection from running — it does not affect any PGSnapper cron job that may have already been installed. However, the cron job is **automatically removed** after a successful Run 2 collection. If you need to remove it manually before that:
+> **Note**: Removing the flag file only prevents invasive collection from running - it does not affect any PGSnapper cron job that may have already been installed. However, the cron job is **automatically removed** after a successful Run 2 collection. If you need to remove it manually before that:
 > ```bash
 > crontab -l | grep -v 'pg_perf_stat_snapper' | crontab -
 > ```
@@ -260,27 +286,27 @@ Your SA will use this data to perform Well Architected Review and provide you wi
 
 **Non-invasive** (no DB credentials needed):
 - RDS/Aurora cluster and instance configuration
-- CloudWatch metrics (CPU, memory, IOPS, connections, replication lag — 7 days)
+- CloudWatch metrics (CPU, memory, IOPS, connections, replication lag - 7 days)
 - Performance Insights top SQL and wait events
 - Parameter group settings
 - Subnet, VPC, and security group configuration
 
 **Invasive** (requires DB credentials):
 - All of the above, plus:
-- `pg_stat_statements` — top queries by execution time and call count *(skipped if extension not installed; pass `skip-pg-stat-statements=true` to `enable-invasive-collection.sh`)*
-- `pg_stat_user_tables` — table bloat, sequential scans, DML activity
-- `pg_stat_user_indexes` — unused and duplicate indexes
-- `pg_stat_bgwriter` — checkpoint and buffer statistics
-- PostgreSQL health insights — comprehensive assessment across 9 areas: database overview, configuration health, connection activity, replication status, data footprint, query/IO performance, maintenance health, optimization opportunities, and security audit *(security queries can be excluded with `--skip-security`)*
+- `pg_stat_statements` - top queries by execution time and call count *(skipped if extension not installed; pass `skip-pg-stat-statements=true` to `enable-invasive-collection.sh`)*
+- `pg_stat_user_tables` - table bloat, sequential scans, DML activity
+- `pg_stat_user_indexes` - unused and duplicate indexes
+- `pg_stat_bgwriter` - checkpoint and buffer statistics
+- PostgreSQL health insights - comprehensive assessment across 9 areas: database overview, configuration health, connection activity, replication status, data footprint, query/IO performance, maintenance health, optimization opportunities, and security audit *(security queries can be excluded with `--skip-security`)*
 - PGPerfStatsSnapper workload snapshots (historical query performance trends, session activity, CPU-heavy queries, checkpoint/temp file trends)
 
 ## Security and privacy
 
-- Database credentials are retrieved from Secrets Manager — never stored in plaintext
+- Database credentials are retrieved from Secrets Manager - never stored in plaintext
 - All data is encrypted in transit (HTTPS/TLS) and at rest (S3 SSE)
 - The S3 bucket is private with public access blocked
 - Data is automatically deleted from S3 after 30 days
-- You retain full control of the S3 bucket — data stays in your account
+- You retain full control of the S3 bucket - data stays in your account
 
 ### PII handling
 
@@ -290,13 +316,13 @@ PII redaction runs **automatically** before any data is written to disk or uploa
 - **Client IP addresses** in connection activity data → SHA-256 hash (first 8 chars)
 - **KMS key ARNs** → trimmed to key ID only (no account ID or region)
 - **Password hashes** in database health data → replaced with `<redacted>`
-- **Query text** — a `query_hash` field is added alongside each query for cross-referencing. The query text itself is **not removed** because `pg_stat_statements` stores only the parameterized form (e.g. `UPDATE t SET col = $1 WHERE id = $2`) which contains no customer data.
+- **Query text** - a `query_hash` field is added alongside each query for cross-referencing. The query text itself is **not removed** because `pg_stat_statements` stores only the parameterized form (e.g. `UPDATE t SET col = $1 WHERE id = $2`) which contains no customer data.
 
 **What is NOT redacted**:
 - Table, column, and schema names
 - All numeric metric values
 - Parameter names and settings
-- Database passwords are never written to any output file — retrieved from Secrets Manager at runtime only
+- Database passwords are never written to any output file - retrieved from Secrets Manager at runtime only
 
 To **skip redaction** (e.g. for internal analysis where you need raw endpoints):
 
@@ -311,7 +337,7 @@ To remove all deployed resources:
 ```bash
 # Step 0: Pre-deletion prerequisites (complete before running Step 1)
 
-# If you deployed with --no-public-ip (without --create-ssm-endpoints), the deploy script added an inbound rule to your VPC's existing SSM endpoints referencing the stack's instance security group. CFN cannot remove this external reference automatically, so you must revoke it manually before deleting the stack — otherwise the deletion will fail.
+# If you deployed with --no-public-ip (without --create-ssm-endpoints), the deploy script added an inbound rule to your VPC's existing SSM endpoints referencing the stack's instance security group. CFN cannot remove this external reference automatically, so you must revoke it manually before deleting the stack - otherwise the deletion will fail.
 INSTANCE_SG=$(aws cloudformation describe-stacks \
   --stack-name wal-db-stats-collection --region <your-region> \
   --query 'Stacks[0].Outputs[?OutputKey==`InstanceSecurityGroup`].OutputValue' \
@@ -324,7 +350,7 @@ REFERENCING_SGS=$(aws ec2 describe-security-groups --region <your-region> \
   --output text)
 
 if [ -z "$REFERENCING_SGS" ] || [ "$REFERENCING_SGS" = "None" ]; then
-  echo "  No external SG references found — safe to delete stack"
+  echo "  No external SG references found - safe to delete stack"
 else
   for SG_ID in $REFERENCING_SGS; do
     aws ec2 revoke-security-group-ingress \
@@ -363,7 +389,7 @@ aws cloudformation wait stack-delete-complete \
 
 > **Note**: The temporary code bucket (`wal-db-stats-code-<account-id>`) is automatically deleted by the deploy script after stack creation completes. If it was not cleaned up automatically, delete it manually: `aws s3 rb s3://wal-db-stats-code-<account-id> --force --region <your-region>`
 
-> **Note**: If you created a NAT Gateway, EIP, private subnet, or route table outside of CloudFormation for this deployment, those resources must be deleted manually — they are not managed by the stack.
+> **Note**: If you created a NAT Gateway, EIP, private subnet, or route table outside of CloudFormation for this deployment, those resources must be deleted manually - they are not managed by the stack.
 
 ## Cost Estimation
 
@@ -375,8 +401,8 @@ All resources are deployed into your AWS account. Costs depend on how long you l
 | S3 storage | $0.023/GB-month | <100 MB of metrics data | <$0.01 |
 | S3 requests | $0.005/1K PUT | ~50 files uploaded | <$0.01 |
 | CloudWatch API | $0.01/1K metrics | ~1,000 metric queries | ~$0.01 |
-| Performance Insights — 7-day retention | Free | Included with RDS/Aurora | $0 |
-| Performance Insights — API calls | $0.01/1K calls | ~400 API calls per run | <$0.01 |
+| Performance Insights - 7-day retention | Free | Included with RDS/Aurora | $0 |
+| Performance Insights - API calls | $0.01/1K calls | ~400 API calls per run | <$0.01 |
 | **SSM VPC endpoints** (Option 3 only) | $0.01/hr × 3 endpoints | 24 hrs | ~$0.72 |
 | **NAT Gateway** (if created for this deployment) | $0.045/hr + $0.045/GB | 24 hrs + ~1 GB data | ~$1.13 |
 
@@ -384,22 +410,22 @@ All resources are deployed into your AWS account. Costs depend on how long you l
 
 | Deployment option | Cost/day |
 |---|---|
-| Option 1 — public subnet | ~$1.00–$1.05 |
-| Option 2 — private subnet + NAT (NAT pre-existing) | ~$1.00–$1.05 |
-| Option 2 — private subnet + NAT (NAT created for this) | ~$2.13–$2.18 |
-| Option 3 — private subnet + NAT + SSM endpoints | ~$1.72–$1.77 (NAT pre-existing) |
+| Option 1 - public subnet | ~$1.00–$1.05 |
+| Option 2 - private subnet + NAT (NAT pre-existing) | ~$1.00–$1.05 |
+| Option 2 - private subnet + NAT (NAT created for this) | ~$2.13–$2.18 |
+| Option 3 - private subnet + NAT + SSM endpoints | ~$1.72–$1.77 (NAT pre-existing) |
 
-> **Note**: To minimize cost, delete the stack as soon as the SA has confirmed receipt of the data. The S3 data bucket has a 30-day lifecycle expiry — objects are deleted automatically.
+> **Note**: To minimize cost, delete the stack as soon as the SA has confirmed receipt of the data. The S3 data bucket has a 30-day lifecycle expiry - objects are deleted automatically.
 
 ## What's New
 
 ### v2.0
 
-- **RDS Multi-AZ DB Cluster support** — fleet discovery, non-invasive collection (CloudWatch from writer, Performance Insights from all 3 instances), and correct WAL lens selection for RDS Multi-AZ DB Clusters
-- **Private subnet deployment** (`--no-public-ip`) — deploy without a public IP or SSH key pair; connect via SSM Session Manager. Key pair and CIDR are no longer required
-- **SSM VPC endpoint automation** — deploy script auto-configures pre-existing SSM endpoints (Pattern A); `--create-ssm-endpoints` flag has CFN create them when none exist (Pattern B)
-- **Code bucket security** — public access blocked and server-side encryption enabled at creation; bucket deleted automatically after stack creation
-- **Stack-scoped log group** — prevents CloudWatch log group conflicts between multiple stacks
+- **RDS Multi-AZ DB Cluster support** - fleet discovery, non-invasive collection (CloudWatch from writer, Performance Insights from all 3 instances), and correct WAL lens selection for RDS Multi-AZ DB Clusters
+- **Private subnet deployment** (`--no-public-ip`) - deploy without a public IP or SSH key pair; connect via SSM Session Manager. Key pair and CIDR are no longer required
+- **SSM VPC endpoint automation** - deploy script auto-configures pre-existing SSM endpoints (Pattern A); `--create-ssm-endpoints` flag has CFN create them when none exist (Pattern B)
+- **Code bucket security** - public access blocked and server-side encryption enabled at creation; bucket deleted automatically after stack creation
+- **Stack-scoped log group** - prevents CloudWatch log group conflicts between multiple stacks
 
 ## Troubleshooting
 
@@ -411,7 +437,7 @@ sudo tail -f /var/log/user-data.log
 ```
 
 **UserData hangs at `dnf update`, `git clone`, or AWS API calls**
-This is the most common symptom of a NACL blocking return traffic (ephemeral ports). The instance security group allows outbound TCP/443 and TCP/5432, but NACLs are stateless — return packets on ports 1024–65535 must be explicitly permitted inbound.
+This is the most common symptom of a NACL blocking return traffic (ephemeral ports). The instance security group allows outbound TCP/443 and TCP/5432, but NACLs are stateless - return packets on ports 1024–65535 must be explicitly permitted inbound.
 - Check the NACL associated with your subnet in the VPC console
 - Ensure inbound ephemeral ports 1024–65535 TCP are allowed from 0.0.0.0/0
 - See the [Network ACL requirements](#network-acl-nacl-requirements) section above for the full rule set
@@ -426,8 +452,8 @@ The instance may still be setting up. Wait a few more minutes and check `/var/lo
 **Invasive collection fails**
 - Confirm the Secrets Manager ARN is correct and the secret contains a `password` key
 - Ensure the EC2 instance security group can reach the database endpoint on its port (default port: 5432)
-- If the error mentions `track_functions`: set `track_functions = all` in the DB parameter group for RDS for PostgreSQL, or the cluster parameter group for Aurora PostgreSQL. This is a dynamic parameter — no reboot required.
-- If the output mentions `[Optional] track_activity_query_size`: this is a recommended improvement, not a blocking error — collection will still run without it. To capture the full text of very long SQL statements that would otherwise be truncated during monitoring, set `track_activity_query_size = 102400` in the DB parameter group for RDS for PostgreSQL, or the cluster parameter group for Aurora PostgreSQL, then reboot the DB instance [REBOOT REQUIRED]. 
+- If the error mentions `track_functions`: set `track_functions = all` in the DB parameter group for RDS for PostgreSQL, or the cluster parameter group for Aurora PostgreSQL. This is a dynamic parameter - no reboot required.
+- If the output mentions `[Optional] track_activity_query_size`: this is a recommended improvement, not a blocking error - collection will still run without it. To capture the full text of very long SQL statements that would otherwise be truncated during monitoring, set `track_activity_query_size = 102400` in the DB parameter group for RDS for PostgreSQL, or the cluster parameter group for Aurora PostgreSQL, then reboot the DB instance [REBOOT REQUIRED]. 
 
 ## DISCLAIMER OF WARRANTIES AND LIABILITY
 
