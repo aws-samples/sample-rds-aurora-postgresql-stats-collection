@@ -1,8 +1,29 @@
 # Database Statistics, Configuration, Performance Metrics Collection Guide
 
-> **Disclaimer**: This tool collects database metrics and configuration data from your AWS environment for Well-Architected review purposes. Review the README.MD carefully and test against your staging/QA environment first to understand the scipts and data collected. Review the data collected before sharing and ensure it complies with your organization's data sharing policies. Please issue a support case to share any data collected to AWS. If any concerns, please reach back to your account SA and proceed with ad-hoc data collection using the issued support case.
+> **Disclaimer**: This tool collects database metrics and configuration data from your AWS environment for Well-Architected review purposes. Review the README carefully and test against your staging/QA environment first to understand the scripts and data collected. Review the data collected before sharing and ensure it complies with your organization's data sharing policies. Please issue a support case to share any data collected to AWS. If any concerns, please reach back to your account SA and proceed with ad-hoc data collection using the issued support case.
 
 ![DB Metrics Report Demo](demo/demo-metrics.gif)
+
+## Table of Contents
+
+**Background**
+- [What this does](#what-this-does)
+- [Architecture](#architecture)
+- [Data collected](#data-collected)
+- [Security and privacy](#security-and-privacy)
+
+**Getting started**
+- [Prerequisites](#prerequisites)
+- [Step 1: Deploy](#step-1-deploy-the-data-collection-instance)
+- [Step 2: Access the instance](#step-2-access-the-instance-for-data-collection)
+- [Step 3: Run collection](#step-3-run-database-statistics-and-metrics-collection)
+- [Step 4: Share data with SA](#step-4-share-collected-data-with-your-sa)
+
+**Reference**
+- [Cost estimate](#cost-estimation)
+- [What's New](#whats-new)
+- [Cleanup](#cleanup)
+- [Troubleshooting](#troubleshooting)
 
 ## What this does
 
