@@ -69,6 +69,11 @@ while [[ $# -gt 0 ]]; do
             SCHEDULE="$2"
             shift 2
             ;;
+        --db-secret-arns)
+            # Repeatable: --db-secret-arns ARN1 --db-secret-arns ARN2 ...
+            DB_SECRET_ARNS+=("$2")
+            shift 2
+            ;;
         --help)
             echo "Usage: $0 [OPTIONS]"
             echo "Deploy customer data collection environment for GenAI WAL Review"
@@ -89,6 +94,13 @@ while [[ $# -gt 0 ]]; do
             echo "  --sa-data-bucket BUCKET         S3 bucket name for SA data sharing (optional)"
             echo "  --enable-scheduled true/false   Enable scheduled data collection (default: true)"
             echo "  --schedule 'CRON'               Cron schedule for data collection (default: '0 6 * * *')"
+            echo "  --db-secret-arns ARN            Secrets Manager access for invasive collection (optional, repeatable)."
+            echo "                                  Three modes:"
+            echo "                                    omitted              No SM permissions (Mode 1 / non-invasive only)."
+            echo "                                    --db-secret-arns '*' All secrets in this account/region. Use when"
+            echo "                                                         you have many clusters or don't know ARNs yet."
+            echo "                                    --db-secret-arns A --db-secret-arns B  Specific ARNs, one per cluster."
+            echo "                                  Wrap ARNs in single quotes if they contain '!' (RDS managed secrets)."
             echo "  --help                          Show this help message"
             echo ""
             echo "Customer Data Collection Workflow:"
@@ -153,6 +165,128 @@ if [[ "$ALLOWED_CIDR" == "0.0.0.0/0" ]]; then
     exit 1
 fi
 SA_DATA_BUCKET=${SA_DATA_BUCKET:-""}
+
+# ── Pre-flight: detect pre-existing Interface Endpoints with PrivateDnsEnabled=true
+#    whose AZ does not match the chosen subnet's AZ.
+#
+#    A VPC Interface Endpoint with PrivateDnsEnabled=true overrides DNS for the service
+#    hostname VPC-wide. The endpoint ENI only lives in its configured subnets' AZs.
+#    If the instance subnet is in a different AZ, DNS resolves to a private IP the
+#    instance cannot route to — API calls silently time out.
+#
+#    Fix: redeploy using a subnet in the same AZ as the existing endpoint.
+# ────────────────────────────────────────────────────────────────────────────────
+echo "🔍 Checking for pre-existing VPC Interface Endpoints that may affect API routing..."
+SERVICES_TO_CHECK=(ssm ssmmessages ec2messages rds monitoring pi cloudformation secretsmanager)
+ENDPOINT_AZ_ERRORS=()
+
+if [ -n "$SUBNET_ID" ]; then
+    for SVC in "${SERVICES_TO_CHECK[@]}"; do
+        EP_INFO=$(aws ec2 describe-vpc-endpoints \
+            --region "$REGION" \
+            --filters "Name=service-name,Values=com.amazonaws.${REGION}.${SVC}" \
+                      "Name=vpc-id,Values=${VPC_ID}" \
+                      "Name=vpc-endpoint-state,Values=available,pending" \
+            --query 'VpcEndpoints[0].{Id:VpcEndpointId,Dns:PrivateDnsEnabled,Subnets:SubnetIds}' \
+            --output json 2>/dev/null || echo "null")
+        EP_ID=$(echo "$EP_INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Id','') or '')" 2>/dev/null || true)
+        EP_DNS=$(echo "$EP_INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Dns','') or '')" 2>/dev/null || true)
+        EP_SUBNETS=$(echo "$EP_INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print(' '.join(d.get('Subnets') or []))" 2>/dev/null || true)
+        [ -z "$EP_ID" ] && continue
+        [ "$EP_DNS" != "True" ] && continue
+        # Chosen subnet is already in the endpoint — traffic routes directly to ENI
+        echo "$EP_SUBNETS" | grep -qw "$SUBNET_ID" && echo "   ✅ $SVC ($EP_ID): chosen subnet is in endpoint — reachable" && continue
+        # Chosen subnet is NOT in the endpoint's subnet list.
+        # DNS will resolve to the endpoint ENI's private IP in a different subnet.
+        # Even within the same AZ, cross-subnet routing to an endpoint ENI is not
+        # guaranteed — the safest fix is to deploy into one of the endpoint's subnets.
+        EP_SUBNET_LIST="$(echo $EP_SUBNETS | xargs)"
+        ENDPOINT_AZ_ERRORS+=("$SVC|$EP_ID|$EP_SUBNET_LIST")
+        echo "   ❌ $SVC ($EP_ID): PrivateDnsEnabled=true but chosen subnet $SUBNET_ID is not in endpoint"
+        echo "      Endpoint subnets: $EP_SUBNET_LIST"
+    done
+fi
+
+if [ ${#ENDPOINT_AZ_ERRORS[@]} -gt 0 ]; then
+    echo ""
+    echo "❌ Deployment blocked: pre-existing VPC Interface Endpoint(s) with PrivateDnsEnabled=true"
+    echo "   do not include the chosen subnet ($SUBNET_ID)."
+    echo ""
+    echo "   Because Private DNS is enabled, all instances in this VPC resolve AWS service"
+    echo "   hostnames (rds.us-east-1.amazonaws.com, etc.) to the endpoint's private IP."
+    echo "   That IP is only reachable from the subnet(s) the endpoint is deployed in."
+    echo "   AWS API calls from the instance would silently time out."
+    echo ""
+    echo "   Affected endpoints:"
+    for ERR in "${ENDPOINT_AZ_ERRORS[@]}"; do
+        SVC="${ERR%%|*}"; REST="${ERR#*|}"; EP_ID="${REST%%|*}"; EP_SUBNETS_ERR="${REST##*|}"
+        echo "     $SVC ($EP_ID) — endpoint subnet(s): $EP_SUBNETS_ERR"
+    done
+    echo ""
+    echo "   You have two options:"
+    echo ""
+    echo "   Option A — Add your chosen subnet to each affected endpoint, then re-run this script:"
+    for ERR in "${ENDPOINT_AZ_ERRORS[@]}"; do
+        REST="${ERR#*|}"; EP_ID="${REST%%|*}"
+        echo "     aws ec2 modify-vpc-endpoint --region $REGION \\"
+        echo "       --vpc-endpoint-id $EP_ID \\"
+        echo "       --add-subnet-ids $SUBNET_ID"
+    done
+    echo ""
+    echo "   Option B — Redeploy using a subnet already in the affected endpoint(s)."
+    # Collect unique endpoint subnets
+    ALL_EP_SUBNETS=""
+    for ERR in "${ENDPOINT_AZ_ERRORS[@]}"; do
+        REST="${ERR#*|}"; EP_SUBNETS_ERR="${REST##*|}"
+        ALL_EP_SUBNETS="$ALL_EP_SUBNETS $EP_SUBNETS_ERR"
+    done
+    UNIQUE_EP_SUBNETS=$(echo "$ALL_EP_SUBNETS" | tr ' ' '\n' | sort -u | grep -v '^$')
+    # Check each for public/private status
+    PUBLIC_SUGGESTIONS=""
+    PRIVATE_SUGGESTIONS=""
+    while IFS= read -r S; do
+        [ -z "$S" ] && continue
+        INFO=$(aws ec2 describe-subnets --subnet-ids "$S" --region "$REGION" \
+            --query 'Subnets[0].{CIDR:CidrBlock,Public:MapPublicIpOnLaunch}' \
+            --output json 2>/dev/null || echo "null")
+        IS_PUBLIC=$(echo "$INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Public',''))" 2>/dev/null || true)
+        CIDR=$(echo "$INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('CIDR',''))" 2>/dev/null || true)
+        if [ "$IS_PUBLIC" = "True" ]; then
+            PUBLIC_SUGGESTIONS="$PUBLIC_SUGGESTIONS\n       $S  ($CIDR)"
+        else
+            PRIVATE_SUGGESTIONS="$PRIVATE_SUGGESTIONS\n       $S  ($CIDR)"
+        fi
+    done <<< "$UNIQUE_EP_SUBNETS"
+    if [ -n "$PUBLIC_SUGGESTIONS" ]; then
+        echo "     Public subnets (use with your current flags):"
+        echo -e "$PUBLIC_SUGGESTIONS"
+    else
+        echo "     Public subnets: none — no public subnet is part of the affected endpoints."
+    fi
+    if [ -n "$PRIVATE_SUGGESTIONS" ]; then
+        echo "     Private subnets (requires --no-public-ip, connect via SSM Session Manager):"
+        echo -e "$PRIVATE_SUGGESTIONS"
+        echo ""
+        if [ -z "$PUBLIC_SUGGESTIONS" ]; then
+            echo "   Since only private subnets are available, you must use --no-public-ip."
+            echo "   Example (Option 2 — private subnet + NAT Gateway, SSM access):"
+            echo "     bash deployment/deploy-db-stats-collection.sh \\"
+            echo "       --no-public-ip \\"
+            echo "       --vpc-id $VPC_ID \\"
+            echo "       --subnet-id <private-subnet-from-list-above> \\"
+            echo "       --region $REGION \\"
+            echo "       [... other flags ...]"
+            echo ""
+            echo "   Connect after deployment via SSM:"
+            echo "     aws ssm start-session --target <instance-id> --region $REGION"
+            echo ""
+            echo "   See README.md Step 2 — 'Accessing the instance in a private subnet' for details."
+        fi
+    fi
+    echo ""
+    echo "   Use --subnet-id <subnet-id> [--no-public-ip] to redeploy."
+    exit 1
+fi
 
 # ── Pre-flight check: --no-public-ip requires NAT Gateway or VPC endpoints ──
 if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]]; then
@@ -293,26 +427,59 @@ else
     OPERATION="create-stack"
 fi
 
+# Build the DBSecretArns CFN parameter value.
+#
+# Three cases depending on what --db-secret-arns received:
+#
+#   not provided → CFN_SECRET_ARNS="" → SM policy omitted (no SM access)
+#
+#   *            → pass '*' as-is → CFN SMBroadAccess condition triggers →
+#                  Resource scoped to arn:aws:secretsmanager:REGION:ACCOUNT:secret:*
+#
+#   specific ARNs → join with commas → CFN SMSpecificAccess condition triggers →
+#                   Resource list is split back from the comma string by CFN !Split
+#
+# Pass the full ARN including the AWS-generated suffix
+# (e.g. arn:aws:secretsmanager:us-east-1:123456789012:secret:my-db-Xk9mPq).
+# The same ARN used in enable-invasive-collection.sh works here as-is.
+CFN_SECRET_ARNS=""
+if [ ${#DB_SECRET_ARNS[@]} -eq 1 ] && [ "${DB_SECRET_ARNS[0]}" = "*" ]; then
+    # Broad mode — explicit opt-in
+    CFN_SECRET_ARNS="*"
+elif [ ${#DB_SECRET_ARNS[@]} -gt 0 ]; then
+    # Specific ARN mode — join with comma, no expansion needed
+    CFN_SECRET_ARNS=$(printf '%s,' "${DB_SECRET_ARNS[@]}")
+    CFN_SECRET_ARNS="${CFN_SECRET_ARNS%,}"  # strip trailing comma
+fi
+
+# Write CFN parameters to a JSON file to avoid AWS CLI shorthand comma-parsing.
+# Build the parameters JSON inline and pass via process substitution.
+# This avoids both the CLI shorthand comma-parsing issue (which would split
+# DBSecretArns on commas) and any temp file dependency.
+CFN_PARAMS="[
+  {\"ParameterKey\":\"KeyPairName\",               \"ParameterValue\":\"${KEY_PAIR:-}\"},
+  {\"ParameterKey\":\"VpcId\",                     \"ParameterValue\":\"$VPC_ID\"},
+  {\"ParameterKey\":\"SubnetId\",                  \"ParameterValue\":\"$SUBNET_ID\"},
+  {\"ParameterKey\":\"InstanceType\",              \"ParameterValue\":\"$INSTANCE_TYPE\"},
+  {\"ParameterKey\":\"AllowedCIDR\",               \"ParameterValue\":\"$ALLOWED_CIDR\"},
+  {\"ParameterKey\":\"AssignPublicIP\",            \"ParameterValue\":\"${ASSIGN_PUBLIC_IP:-true}\"},
+  {\"ParameterKey\":\"CreateSSMEndpoints\",        \"ParameterValue\":\"${CREATE_SSM_ENDPOINTS:-false}\"},
+  {\"ParameterKey\":\"DBPort\",                    \"ParameterValue\":\"${DB_PORT:-5432}\"},
+  {\"ParameterKey\":\"SADataBucket\",              \"ParameterValue\":\"$SA_DATA_BUCKET\"},
+  {\"ParameterKey\":\"ResolvedDataBucketName\",    \"ParameterValue\":\"$RESOLVED_DATA_BUCKET\"},
+  {\"ParameterKey\":\"EnableScheduledCollection\", \"ParameterValue\":\"$ENABLE_SCHEDULED\"},
+  {\"ParameterKey\":\"CollectionSchedule\",        \"ParameterValue\":\"$SCHEDULE\"},
+  {\"ParameterKey\":\"CodeSourceBucket\",          \"ParameterValue\":\"$CODE_BUCKET\"},
+  {\"ParameterKey\":\"CodeSourceKey\",             \"ParameterValue\":\"$CODE_KEY\"},
+  {\"ParameterKey\":\"DBSecretArns\",              \"ParameterValue\":\"$CFN_SECRET_ARNS\"}
+]"
+
 # Deploy stack
 echo "⚡ Deploying CloudFormation stack..."
 aws cloudformation "$OPERATION" \
     --stack-name "$STACK_NAME" \
     --template-body "file://$TEMPLATE_FILE" \
-    --parameters \
-        "ParameterKey=KeyPairName,ParameterValue=${KEY_PAIR:-}" \
-        "ParameterKey=VpcId,ParameterValue=$VPC_ID" \
-        "ParameterKey=SubnetId,ParameterValue=$SUBNET_ID" \
-        "ParameterKey=InstanceType,ParameterValue=$INSTANCE_TYPE" \
-        "ParameterKey=AllowedCIDR,ParameterValue=$ALLOWED_CIDR" \
-        "ParameterKey=AssignPublicIP,ParameterValue=${ASSIGN_PUBLIC_IP:-true}" \
-        "ParameterKey=CreateSSMEndpoints,ParameterValue=${CREATE_SSM_ENDPOINTS:-false}" \
-        "ParameterKey=DBPort,ParameterValue=${DB_PORT:-5432}" \
-        "ParameterKey=SADataBucket,ParameterValue=$SA_DATA_BUCKET" \
-        "ParameterKey=ResolvedDataBucketName,ParameterValue=$RESOLVED_DATA_BUCKET" \
-        "ParameterKey=EnableScheduledCollection,ParameterValue=$ENABLE_SCHEDULED" \
-        "ParameterKey=CollectionSchedule,ParameterValue=$SCHEDULE" \
-        "ParameterKey=CodeSourceBucket,ParameterValue=$CODE_BUCKET" \
-        "ParameterKey=CodeSourceKey,ParameterValue=$CODE_KEY" \
+    --parameters "$CFN_PARAMS" \
     --capabilities CAPABILITY_NAMED_IAM \
     --region "$REGION"
 
