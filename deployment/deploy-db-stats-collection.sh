@@ -178,7 +178,8 @@ SA_DATA_BUCKET=${SA_DATA_BUCKET:-""}
 # ────────────────────────────────────────────────────────────────────────────────
 echo "🔍 Checking for pre-existing VPC Interface Endpoints that may affect API routing..."
 SERVICES_TO_CHECK=(ssm ssmmessages ec2messages rds monitoring pi cloudformation secretsmanager)
-ENDPOINT_AZ_ERRORS=()
+ENDPOINT_SUBNET_ERRORS=()
+PRE_EXISTING_EP_SGS=""
 
 if [ -n "$SUBNET_ID" ]; then
     for SVC in "${SERVICES_TO_CHECK[@]}"; do
@@ -194,20 +195,41 @@ if [ -n "$SUBNET_ID" ]; then
         EP_SUBNETS=$(echo "$EP_INFO" | python3 -c "import sys,json; d=json.load(sys.stdin); print(' '.join(d.get('Subnets') or []))" 2>/dev/null || true)
         [ -z "$EP_ID" ] && continue
         [ "$EP_DNS" != "True" ] && continue
-        # Chosen subnet is already in the endpoint — traffic routes directly to ENI
-        echo "$EP_SUBNETS" | grep -qw "$SUBNET_ID" && echo "   ✅ $SVC ($EP_ID): chosen subnet is in endpoint — reachable" && continue
+        # Chosen subnet is in the endpoint — ENI is directly reachable.
+        # Also check the endpoint's SG allows TCP/443. If not, record it for
+        # post-deploy rule injection (instance SG is only known after CFN creates it).
+        if echo "$EP_SUBNETS" | grep -qw "$SUBNET_ID"; then
+            echo "   ✅ $SVC ($EP_ID): chosen subnet is in endpoint subnet list — reachable"
+            EP_SG=$(aws ec2 describe-vpc-endpoints \
+                --vpc-endpoint-ids "$EP_ID" --region "$REGION" \
+                --query 'VpcEndpoints[0].Groups[0].GroupId' --output text 2>/dev/null || true)
+            if [ -n "$EP_SG" ] && [ "$EP_SG" != "None" ]; then
+                HAS_443=$(aws ec2 describe-security-group-rules \
+                    --filters "Name=group-id,Values=$EP_SG" --region "$REGION" \
+                    --query "SecurityGroupRules[?!IsEgress && FromPort<=\`443\` && ToPort>=\`443\`].{Cidr:CidrIpv4,SG:ReferencedGroupInfo.GroupId}" \
+                    --output json 2>/dev/null || echo "[]")
+                ALLOWS_ALL=$(echo "$HAS_443" | python3 -c "import sys,json; rules=json.load(sys.stdin); print('yes' if any(r.get('Cidr')=='0.0.0.0/0' for r in rules) else 'no')" 2>/dev/null)
+                if [ "$ALLOWS_ALL" != "yes" ]; then
+                    echo "      ⚠️  Endpoint SG $EP_SG does not allow TCP/443 from all sources."
+                    echo "         The deploy script will add an inbound TCP/443 rule scoped to"
+                    echo "         the new instance SG after stack creation (idempotent — skipped if rule exists)."
+                    PRE_EXISTING_EP_SGS="${PRE_EXISTING_EP_SGS:-} $EP_SG"
+                fi
+            fi
+            continue
+        fi
         # Chosen subnet is NOT in the endpoint's subnet list.
         # DNS will resolve to the endpoint ENI's private IP in a different subnet.
         # Even within the same AZ, cross-subnet routing to an endpoint ENI is not
         # guaranteed — the safest fix is to deploy into one of the endpoint's subnets.
         EP_SUBNET_LIST="$(echo $EP_SUBNETS | xargs)"
-        ENDPOINT_AZ_ERRORS+=("$SVC|$EP_ID|$EP_SUBNET_LIST")
+        ENDPOINT_SUBNET_ERRORS+=("$SVC|$EP_ID|$EP_SUBNET_LIST")
         echo "   ❌ $SVC ($EP_ID): PrivateDnsEnabled=true but chosen subnet $SUBNET_ID is not in endpoint"
         echo "      Endpoint subnets: $EP_SUBNET_LIST"
     done
 fi
 
-if [ ${#ENDPOINT_AZ_ERRORS[@]} -gt 0 ]; then
+if [ ${#ENDPOINT_SUBNET_ERRORS[@]} -gt 0 ]; then
     echo ""
     echo "❌ Deployment blocked: pre-existing VPC Interface Endpoint(s) with PrivateDnsEnabled=true"
     echo "   do not include the chosen subnet ($SUBNET_ID)."
@@ -218,7 +240,7 @@ if [ ${#ENDPOINT_AZ_ERRORS[@]} -gt 0 ]; then
     echo "   AWS API calls from the instance would silently time out."
     echo ""
     echo "   Affected endpoints:"
-    for ERR in "${ENDPOINT_AZ_ERRORS[@]}"; do
+    for ERR in "${ENDPOINT_SUBNET_ERRORS[@]}"; do
         SVC="${ERR%%|*}"; REST="${ERR#*|}"; EP_ID="${REST%%|*}"; EP_SUBNETS_ERR="${REST##*|}"
         echo "     $SVC ($EP_ID) — endpoint subnet(s): $EP_SUBNETS_ERR"
     done
@@ -226,7 +248,7 @@ if [ ${#ENDPOINT_AZ_ERRORS[@]} -gt 0 ]; then
     echo "   You have two options:"
     echo ""
     echo "   Option A — Add your chosen subnet to each affected endpoint, then re-run this script:"
-    for ERR in "${ENDPOINT_AZ_ERRORS[@]}"; do
+    for ERR in "${ENDPOINT_SUBNET_ERRORS[@]}"; do
         REST="${ERR#*|}"; EP_ID="${REST%%|*}"
         echo "     aws ec2 modify-vpc-endpoint --region $REGION \\"
         echo "       --vpc-endpoint-id $EP_ID \\"
@@ -236,7 +258,7 @@ if [ ${#ENDPOINT_AZ_ERRORS[@]} -gt 0 ]; then
     echo "   Option B — Redeploy using a subnet already in the affected endpoint(s)."
     # Collect unique endpoint subnets
     ALL_EP_SUBNETS=""
-    for ERR in "${ENDPOINT_AZ_ERRORS[@]}"; do
+    for ERR in "${ENDPOINT_SUBNET_ERRORS[@]}"; do
         REST="${ERR#*|}"; EP_SUBNETS_ERR="${REST##*|}"
         ALL_EP_SUBNETS="$ALL_EP_SUBNETS $EP_SUBNETS_ERR"
     done
@@ -563,6 +585,44 @@ if [[ "${ASSIGN_PUBLIC_IP:-true}" == "false" ]] && [[ "${CREATE_SSM_ENDPOINTS:-f
     else
         echo "   ⚠️  Could not retrieve instance security group — SSM endpoint configuration skipped."
         echo "      You may need to manually add this stack's SG to existing SSM VPC endpoint SGs."
+    fi
+fi
+
+# ── Post-deploy: inject instance SG into pre-existing endpoint SGs ──────────
+# When a pre-existing VPC Interface Endpoint has PrivateDnsEnabled=true and the
+# chosen subnet is in its subnet list, DNS routes traffic to that endpoint VPC-wide.
+# The endpoint's SG must allow TCP/443 from the instance SG, or API calls are
+# silently dropped even though the subnet check passes. We add the rule here
+# (post-deploy) because the instance SG is only known after CFN creates it.
+if [ -n "${PRE_EXISTING_EP_SGS:-}" ]; then
+    INSTANCE_SG=$(aws cloudformation describe-stacks \
+        --stack-name "$STACK_NAME" --region "$REGION" \
+        --query 'Stacks[0].Outputs[?OutputKey==`InstanceSecurityGroup`].OutputValue' \
+        --output text 2>/dev/null)
+    if [ -n "$INSTANCE_SG" ] && [ "$INSTANCE_SG" != "None" ]; then
+        echo ""
+        echo "🔗 Adding instance SG to pre-existing endpoint SG(s) for API access..."
+        PATCHED_PRE_SGS=""
+        for EP_SG in $PRE_EXISTING_EP_SGS; do
+            [ -z "$EP_SG" ] && continue
+            # Skip if already patched (dedup without associative array — bash 3 compatible)
+            echo "$PATCHED_PRE_SGS" | grep -qw "$EP_SG" && continue
+            PATCHED_PRE_SGS="$PATCHED_PRE_SGS $EP_SG"
+            RULE_EXISTS=$(aws ec2 describe-security-group-rules \
+                --filters "Name=group-id,Values=${EP_SG}" --region "$REGION" \
+                --query "SecurityGroupRules[?ReferencedGroupInfo.GroupId=='${INSTANCE_SG}' && FromPort==\`443\` && !IsEgress].SecurityGroupRuleId" \
+                --output text 2>/dev/null || true)
+            if [ -n "$RULE_EXISTS" ] && [ "$RULE_EXISTS" != "None" ]; then
+                echo "   ✅ Endpoint SG $EP_SG: inbound TCP/443 rule for $INSTANCE_SG already exists"
+            else
+                aws ec2 authorize-security-group-ingress \
+                    --group-id "$EP_SG" \
+                    --ip-permissions "[{\"IpProtocol\":\"tcp\",\"FromPort\":443,\"ToPort\":443,\"UserIdGroupPairs\":[{\"GroupId\":\"$INSTANCE_SG\"}]}]" \
+                    --region "$REGION" --output text > /dev/null 2>&1 \
+                    && echo "   ✅ Endpoint SG $EP_SG: added inbound TCP/443 from $INSTANCE_SG" \
+                    || echo "   ⚠️  Endpoint SG $EP_SG: could not add rule (check IAM permissions)"
+            fi
+        done
     fi
 fi
 
