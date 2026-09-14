@@ -46,14 +46,14 @@ Deploys a lightweight EC2 instance in your AWS account that:
   │ (analysis)   │  │  │                              │   │ PostgreSQL           │ │
   └──────┬───────┘  │  │ Installed:                   │   │                      │ │
          │          │  │  - Python 3.11               │   │  - pg_stat_          │ │
-         │          │  │  - PostgreSQL 15 client      │   │    statements        │ │
-         │◄─────────┼──│  - PGPerfStatsSnapper        │   │  - Database Insights │ │
-          share     │  │  - Local PostgreSQL DB       │   └──────────────────────┘ │
-                    │  │    (PGSnapper analysis)      │                            │
-                    │  │                              │   ┌──────────────────────┐ │
-                    │  │ Collects:                    │──►│ S3 (data bucket)     │ │
-                    │  │  - CloudWatch metrics        │   └──────────────────────┘ │
-                    │  │  - Database Insights         │                            │
+  share  │          │  │  - PostgreSQL 15 client      │   │    statements        │ │
+  *.json │          │  │  - PGPerfStatsSnapper        │   │  - Database Insights │ │
+         │          │  │  - Local PostgreSQL DB       │   └──────────────────────┘ │
+  ┌──────┴───────┐  │  │    (PGSnapper analysis)      │                            │
+  │ Customer     │  │  │                              │   ┌──────────────────────┐ │
+  │ downloads &  │◄─┼──│ Collects:                    │──►│ S3 (data bucket)     │ │
+  │ shares data  │  │  │  - CloudWatch metrics        │   └──────────────────────┘ │
+  └──────────────┘  │  │  - Database Insights         │                            │
                     │  │  - DB statistics             │                            │
                     │  └──────────────────────────────┘                            │
                     └──────────────────────────────────────────────────────────────┘
@@ -67,6 +67,7 @@ Deploys a lightweight EC2 instance in your AWS account that:
 - A VPC with a subnet (public or private - see deployment options below)
 - IAM permissions: EC2, CloudFormation, S3, RDS, CloudWatch, Performance Insights
 - An EC2 Key Pair - required only for **public subnet** deployments (SSH access). Not needed for `--no-public-ip` deployments.
+- [`pg_stat_statements`](https://www.postgresql.org/docs/current/pgstatstatements.html) extension enabled on any PostgreSQL database you want to collect query performance statistics from. See [Step 3: Run database statistics and metrics collection](#step-3-run-database-statistics-and-metrics-collection) for details.
 
 ### Network ACL (NACL) requirements
 
@@ -103,8 +104,11 @@ bash deployment/deploy-db-stats-collection.sh \
   --vpc-id <your-vpc-id> \
   --subnet-id <your-public-subnet-id> \
   --allowed-cidr <your-ip>/32 \
-  --region <your-region>
+  --region <your-region> \
   --db-port 5432          # optional: only needed if your RDS/Aurora endpoint uses a non-standard port
+  --db-secret-arns '<secret-arn-1>' \  # optional: 1 or more Secrets Manager ARNs, one per cluster
+  --db-secret-arns '<secret-arn-2>'    # omit entirely for no Secrets Manager access (CloudWatch/PI only)
+  # --db-secret-arns '*'               # or use '*' to allow all secrets in this account/region
 
 # Option 2: Private subnet with NAT Gateway (SSM access, no SSH)
 bash deployment/deploy-db-stats-collection.sh \
@@ -113,6 +117,9 @@ bash deployment/deploy-db-stats-collection.sh \
   --subnet-id <your-private-subnet-id> \
   --region <your-region> \
   --db-port 5432          # optional: only needed if your RDS/Aurora endpoint uses a non-standard port
+  --db-secret-arns '<secret-arn-1>' \  # optional: 1 or more Secrets Manager ARNs, one per cluster
+  --db-secret-arns '<secret-arn-2>'    # omit entirely for no Secrets Manager access (CloudWatch/PI only)
+  # --db-secret-arns '*'               # or use '*' to allow all secrets in this account/region
 
 # Option 3: Private subnet with NAT Gateway - CFN creates SSM VPC endpoints to keep SSM traffic off the public internet
 bash deployment/deploy-db-stats-collection.sh \
@@ -122,6 +129,9 @@ bash deployment/deploy-db-stats-collection.sh \
   --subnet-id <your-private-subnet-id> \
   --region <your-region> \
   --db-port 5432          # optional: only needed if your RDS/Aurora endpoint uses a non-standard port
+  --db-secret-arns '<secret-arn-1>' \  # optional: 1 or more Secrets Manager ARNs, one per cluster
+  --db-secret-arns '<secret-arn-2>'    # omit entirely for no Secrets Manager access (CloudWatch/PI only)
+  # --db-secret-arns '*'               # or use '*' to allow all secrets in this account/region
 ```
 
 The script will:
@@ -131,7 +141,7 @@ The script will:
 3. The EC2 instance clones the repo from GitHub on boot (falls back to S3 if GitHub is unreachable)
 4. Print the instance ID, IP, SSM connect command, and data S3 bucket name on completion
 
-> **Note**: In a private subnet with a NAT Gateway, [AWS Systems Manager Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/what-is-systems-manager.html) works automatically via NAT - no VPC endpoints are required. It requires outbound connectivity to `ssm`, `ssmmessages`, and `ec2messages` endpoints for keeping SSM traffic off the public internet. If your VPC already has SSM VPC endpoints, the deploy script automatically adds the instance subnet and security group to them. Use `--create-ssm-endpoints` if you want SSM traffic to stay within the AWS network (off the public internet) - CloudFormation will create the three required Interface VPC Endpoints scoped to the deployment subnet.
+> **Note**: For **Option 2** (private subnet + NAT Gateway), SSM Session Manager connects to the instance via NAT - no VPC endpoints are needed. If your VPC already has SSM VPC endpoints, the deploy script automatically adds the instance subnet and security group to them so SSM continues to work. For **Option 3**, use `--create-ssm-endpoints` to have CloudFormation create the three SSM Interface VPC Endpoints (`ssm`, `ssmmessages`, `ec2messages`) scoped to the deployment subnet, keeping SSM traffic within the AWS network and off the public internet. A NAT Gateway is still required for bootstrap and S3 uploads in both Option 2 and Option 3.
 
 Wait ~10 minutes for the instance to finish setup after the stack completes.
 
@@ -146,6 +156,7 @@ Wait ~10 minutes for the instance to finish setup after the stack completes.
 | `--no-public-ip` | No | - | Deploy without a public IP address. Use when deploying into a **private subnet with a NAT Gateway**. SSH is not available; connect via [AWS Systems Manager Session Manager](#accessing-the-instance-in-a-private-subnet). When set, `--key-pair` and `--allowed-cidr` are not required. The deploy script automatically configures pre-existing SSM VPC endpoints if present. |
 | `--create-ssm-endpoints` | No | - | Use with `--no-public-ip` when the VPC has **no existing SSM VPC endpoints**. Creates three Interface VPC Endpoints (`ssm`, `ssmmessages`, `ec2messages`) as part of the CloudFormation stack, enabling Session Manager connectivity via VPC endpoints rather than via NAT. A NAT Gateway is still required for bootstrap and S3 uploads. See [SSM VPC endpoint options](#ssm-vpc-endpoint-options-for-no-public-ip-deployments) below. |
 | `--db-port` | No | `5432` | PostgreSQL port on your RDS/Aurora endpoint. Only needed for invasive collection if your database uses a non-standard port. Drives the outbound security group egress rule. |
+| `--db-secret-arns` | No | (empty) | Secrets Manager ARN for database credentials used for query performance statistics collection (Step 3). Repeatable — pass once per cluster. Three access modes: **(1) Omit** - **NO Secrets Manager access**, CloudWatch/PI collection only. **(2) `'*'`** - access to all secrets in this account and region. **(3) Specific ARNs** - least-privilege access, one ARN per cluster (recommended). Wrap in single quotes if the ARN contains `!` (e.g. `rds!cluster-...`). When using specific ARNs, **always pass the complete set across all clusters** - the EC2 role is updated to allow exactly the ARNs provided, so omitting an existing cluster removes its access. |
 | `--region` | No | `us-east-1` | AWS region to deploy into |
 | `--instance-type` | No | `t3.medium` | EC2 instance type |
 | `--sa-data-bucket` | No | auto-created | Existing S3 bucket name for data sharing with your SA. If omitted, a bucket named `wal-db-stats-collection-<account-id>` is created automatically. |
@@ -155,13 +166,15 @@ Wait ~10 minutes for the instance to finish setup after the stack completes.
 
 ## Step 2: Access the instance for data collection
 
+### Option 1 (Public subnet): Access via SSH
+
 SSH to the instance and run the collection script:
 
 ```bash
 ssh -i <your-key-pair>.pem ec2-user@<instance-ip>
 ```
 
-### Accessing the instance in a private subnet
+### Option 2 / Option 3 (Private subnet): Access via SSM Session Manager
 
 If you deploy into a private subnet (no public IP), SSH from your machine won't reach the instance. Use **AWS Systems Manager Session Manager** instead - no open inbound ports, no bastion host required.
 
@@ -231,6 +244,8 @@ Example:
 ```
 
 With the example above (`pgsnapper-min-days=1`, `pgsnapper-interval=60`), wait at least 1 day between runs. For a quick test, use `pgsnapper-min-days=0.01` (~15 minutes) and `pgsnapper-interval=1` (1 minute interval).
+
+> **Note**: After running `enable-invasive-collection.sh`, the script checks whether the EC2 instance role already has permission to read the registered secret. If not, it prints a reminder to re-run `deploy-db-stats-collection.sh` with `--db-secret-arns` before proceeding. You can also provide `--db-secret-arns` upfront during the initial deploy in Step 1 to skip this step.
 
 ### Step 3.2 Run collection and generate reports
 
@@ -475,6 +490,14 @@ The instance may still be setting up. Wait a few more minutes and check `/var/lo
 - Ensure the EC2 instance security group can reach the database endpoint on its port (default port: 5432)
 - If the error mentions `track_functions`: set `track_functions = all` in the DB parameter group for RDS for PostgreSQL, or the cluster parameter group for Aurora PostgreSQL. This is a dynamic parameter - no reboot required.
 - If the output mentions `[Optional] track_activity_query_size`: this is a recommended improvement, not a blocking error - collection will still run without it. To capture the full text of very long SQL statements that would otherwise be truncated during monitoring, set `track_activity_query_size = 102400` in the DB parameter group for RDS for PostgreSQL, or the cluster parameter group for Aurora PostgreSQL, then reboot the DB instance [REBOOT REQUIRED]. 
+
+**Deployment blocked: pre-existing VPC Interface Endpoints**
+
+If the deploy script exits with `❌ Deployment blocked: pre-existing VPC Interface Endpoint(s) with PrivateDnsEnabled=true do not include the chosen subnet`, your VPC has existing Interface Endpoints whose private DNS overrides AWS service hostnames VPC-wide, but the chosen subnet is not in the endpoint's subnet list - API calls from the instance would silently time out.
+
+The error output includes two options:
+- **Option A** - add your chosen subnet to each affected endpoint using the exact `aws ec2 modify-vpc-endpoint` commands printed by the script, then re-run the deploy.
+- **Option B** - redeploy using a subnet already in the endpoint's subnet list. The script lists compatible public or private subnets based on your chosen deployment mode.
 
 ## DISCLAIMER OF WARRANTIES AND LIABILITY
 
