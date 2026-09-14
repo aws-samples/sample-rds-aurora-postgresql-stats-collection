@@ -71,6 +71,34 @@ Parameters:
     Description: S3 key for application code zip file
     Default: 'wal-db-stats-collection.zip'
 
+  DBSecretArns:
+    Type: String
+    Default: ''
+    Description: >
+      Controls which Secrets Manager secrets the EC2 instance can read for
+      invasive data collection (PGSnapper). Accepts one of three values:
+
+      (empty)  — The EC2 instance has NO Secrets Manager access.
+                 Invasive collection will not work.
+                 Use this when running non-invasive (Mode 1) collection only.
+                 Example: leave the field blank.
+
+      *        — The EC2 instance can read ALL secrets in this account and region.
+                 Use this when you have multiple clusters or do not know the ARNs yet.
+                 Example: *
+
+      ARN list — The EC2 instance can only read the listed secrets.
+                 Enter a comma-separated list of full secret ARNs, one per cluster.
+                 No spaces around commas. No quotes needed. Include the full ARN
+                 with the AWS-generated 6-character suffix.
+                 Example (one cluster):
+                   arn:aws:secretsmanager:us-east-1:123456789012:secret:rds!cluster-abc123-XkPqMn
+                 Example (two clusters):
+                   arn:aws:secretsmanager:us-east-1:123456789012:secret:rds!cluster-abc123-XkPqMn,arn:aws:secretsmanager:us-east-1:123456789012:secret:my-db-secret-AbCdEf
+
+      To find a secret ARN: AWS Console > Secrets Manager > select secret > copy ARN.
+      When using deploy-db-stats-collection.sh, use --db-secret-arns instead of editing this directly.
+
   AssignPublicIP:
     Type: String
     Default: 'false'
@@ -97,6 +125,12 @@ Conditions:
   NeedSSMEndpoints: !And
     - !Equals [!Ref AssignPublicIP, 'false']
     - !Equals [!Ref CreateSSMEndpoints, 'true']
+  # SM broad mode: customer passed '*' — grant access to all secrets in this account/region.
+  SMBroadAccess: !Equals [!Ref DBSecretArns, '*']
+  # SM specific mode: non-empty and not '*' — grant access to the supplied ARN list only.
+  SMSpecificAccess: !And
+    - !Not [!Equals [!Ref DBSecretArns, '']]
+    - !Not [!Equals [!Ref DBSecretArns, '*']]
 
 Resources:
   # S3 Bucket for data sharing with SA
@@ -232,12 +266,28 @@ Resources:
                     - 'arn:aws:s3:::${BucketName}'
                     - BucketName: !If [HasSADataBucket, !Ref SADataBucket, !Sub '${AWS::StackName}-${AWS::AccountId}']
               
-              # Secrets Manager permissions for PGSnapper
-              - Effect: Allow
-                Action:
-                  - secretsmanager:GetSecretValue
-                  - secretsmanager:DescribeSecret
-                Resource: '*'
+              # Secrets Manager permissions for PGSnapper (invasive collection only).
+              # Behaviour is controlled by the DBSecretArns parameter:
+              #   empty  → statement omitted entirely (no SM access)
+              #   *      → scoped to all secrets in this account/region
+              #   ARNs   → scoped to the exact ARN list supplied at deploy time
+              - !If
+                - SMBroadAccess
+                - Effect: Allow
+                  Action:
+                    - secretsmanager:GetSecretValue
+                    - secretsmanager:DescribeSecret
+                  Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
+                - !If
+                  - SMSpecificAccess
+                  - Effect: Allow
+                    Action:
+                      - secretsmanager:GetSecretValue
+                      - secretsmanager:DescribeSecret
+                    # DBSecretArns is a comma-joined string of full secret ARNs built by
+                    # deploy-db-stats-collection.sh. CFN splits it back into a list via !Split.
+                    Resource: !Split [',', !Ref DBSecretArns]
+                  - !Ref 'AWS::NoValue'
               
               # S3 permissions for code source bucket (if provided)
               - !If
@@ -257,6 +307,15 @@ Resources:
                   - ec2:DescribeAvailabilityZones
                 Resource: '*'
               
+              # IAM permission to read this role's own inline policy
+              # Used by enable-invasive-collection.sh to check whether the SM policy
+              # already covers the registered secret ARNs before printing the reminder.
+              # Scoped to this role only — cannot read any other role's policies.
+              - Effect: Allow
+                Action:
+                  - iam:GetRolePolicy
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-DataCollectionRole'
+
               # Logs permissions
               - Effect: Allow
                 Action:
@@ -468,11 +527,12 @@ Resources:
           EOF
           
           # Scripts are now packaged in the zip (deployment/collect-and-share.sh, deployment/enable-invasive-collection.sh)
-          # Write config file with deployment-specific values (region, bucket)
+          # Write config file with deployment-specific values (region, bucket, stack name)
           cat > /home/ec2-user/wal-db-stats-collection/deployment/collection.conf << 'CONF'
           AWS_REGION=${AWS::Region}
           CUSTOMER_DATA_BUCKET=${ResolvedDataBucketName}
           DATA_DIR=/home/ec2-user/wal-db-stats-collection/data
+          STACK_NAME=${AWS::StackName}
           CONF
           sed -i 's/^[[:space:]]*//' /home/ec2-user/wal-db-stats-collection/deployment/collection.conf
           

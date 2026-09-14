@@ -1697,6 +1697,7 @@ def main():
         )
         
         # Check PGSnapper status and provide user guidance
+        is_setup_only = result.get('collection_type') == 'invasive_setup_only'
         if 'pgsnapper' in result:
             pgsnapper_status = result['pgsnapper'].get('status')
             if pgsnapper_status == 'collecting':
@@ -1715,7 +1716,16 @@ def main():
                 print(f"        --pgsnapper-min-days {args.pgsnapper_min_days} \\")
                 print(f"        --pgsnapper-interval {args.pgsnapper_interval} \\")
                 print(f"        --output-dir {args.output_dir}")
-                print(f"\n✅ Non-invasive and basic invasive data collection completed (without PGSnapper analysis)")
+                if is_setup_only:
+                    # Run 1: only cron was installed, no invasive data collected
+                    print(f"\n✅ PGSnapper cron job installed. Snapshots will be collected every {args.pgsnapper_interval} minute(s).")
+                    print(f"   No invasive data has been collected yet.")
+                    print(f"   Wait {args.pgsnapper_min_days} day(s), then re-run ./collect-and-share.sh.")
+                    print(f"   The second run will collect non-invasive + invasive data with aligned timestamps.")
+                else:
+                    # Run 2 partial: invasive data collected but PGSnapper snapshots insufficient
+                    print(f"\n✅ Invasive data collection completed (pg_stat_statements, table stats, health queries).")
+                    print(f"   PGSnapper workload trend analysis will be added on the next run.")
             elif pgsnapper_status == 'analyzed':
                 print(f"✅ Invasive data collection completed successfully for cluster {args.cluster_id}")
                 print(f"   Including PGSnapper analysis with {result['pgsnapper']['data_status']['days']} days of data")
@@ -1723,7 +1733,11 @@ def main():
                 print(f"\n⚠️  PGSnapper data collection encountered an error")
                 print(f"   Error: {result['pgsnapper'].get('error')}")
                 print(f"   {result['pgsnapper'].get('next_steps')}")
-                print(f"\n✅ Non-invasive and basic invasive data collection completed (without PGSnapper)")
+                if is_setup_only:
+                    print(f"\n   Fix the issue above, then re-run ./collect-and-share.sh to retry setup.")
+                else:
+                    print(f"\n✅ Invasive data collection completed (pg_stat_statements, table stats, health queries).")
+                    print(f"   PGSnapper workload trend analysis could not run — fix the issue above and re-run.")
         else:
             print(f"✅ Invasive data collection completed successfully for cluster {args.cluster_id}")
         
