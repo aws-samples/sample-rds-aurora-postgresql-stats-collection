@@ -21,9 +21,9 @@
 
 **Reference**
 - [Cost estimate](#cost-estimation)
-- [What's New](#whats-new)
 - [Cleanup](#cleanup)
 - [Troubleshooting](#troubleshooting)
+- [What's New](#whats-new)
 
 ## What this does
 
@@ -454,16 +454,6 @@ All resources are deployed into your AWS account. Costs depend on how long you l
 
 > **Note**: To minimize cost, delete the stack as soon as the SA has confirmed receipt of the data. The S3 data bucket has a 30-day lifecycle expiry - objects are deleted automatically.
 
-## What's New
-
-### v2.0
-
-- **RDS Multi-AZ DB Cluster support** - fleet discovery, non-invasive collection (CloudWatch from writer, Performance Insights from all 3 instances), and correct WAL lens selection for RDS Multi-AZ DB Clusters
-- **Private subnet deployment** (`--no-public-ip`) - deploy without a public IP or SSH key pair; connect via SSM Session Manager. Key pair and CIDR are no longer required
-- **SSM VPC endpoint automation** - deploy script auto-configures pre-existing SSM endpoints (Pattern A); `--create-ssm-endpoints` flag has CFN create them when none exist (Pattern B)
-- **Code bucket security** - public access blocked and server-side encryption enabled at creation; bucket deleted automatically after stack creation
-- **Stack-scoped log group** - prevents CloudWatch log group conflicts between multiple stacks
-
 ## Troubleshooting
 
 **Instance setup not complete after 10 minutes**
@@ -499,6 +489,22 @@ If the deploy script exits with `❌ Deployment blocked: pre-existing VPC Interf
 The error output includes two options:
 - **Option A** - add your chosen subnet to each affected endpoint using the exact `aws ec2 modify-vpc-endpoint` commands printed by the script, then re-run the deploy.
 - **Option B** - redeploy using a subnet already in the endpoint's subnet list. The script lists compatible public or private subnets based on your chosen deployment mode.
+
+## What's New
+
+### v3.0
+
+- **Scoped Secrets Manager permissions** (`--db-secret-arns`) - the EC2 instance role now grants access only to the specific secrets needed for database statistics collection, rather than all secrets in the account. Supports a single secret, multiple secrets (one per cluster), or `*` for account/region-wide access. See [Step 1 parameters](#parameters) for details.
+- **VPC Interface Endpoint compatibility** - the deploy script now detects pre-existing Interface Endpoints with Private DNS enabled and either warns with remediation steps or automatically adds the instance security group to endpoint SGs post-deploy, preventing silent API call timeouts.
+- **EC2 bootstrap hardening** - git clones are pinned to reviewed commit SHAs and verified after checkout; falls back to the S3 package (built from the same commit) if verification fails. EBS root volume is now explicitly encrypted. Local PostgreSQL trust auth narrowed to the `postgres` role and `localhost` only. Thanks to [@ethervoid (Mario de Frutos Dieguez)](https://github.com/ethervoid) for this contribution.
+
+### v2.0
+
+- **RDS Multi-AZ DB Cluster support** - fleet discovery, non-invasive collection (CloudWatch from writer, Performance Insights from all 3 instances), and correct WAL lens selection for RDS Multi-AZ DB Clusters
+- **Private subnet deployment** (`--no-public-ip`) - deploy without a public IP or SSH key pair; connect via SSM Session Manager. Key pair and CIDR are no longer required
+- **SSM VPC endpoint automation** - deploy script auto-configures pre-existing SSM endpoints (Pattern A); `--create-ssm-endpoints` flag has CFN create them when none exist (Pattern B)
+- **Code bucket security** - public access blocked and server-side encryption enabled at creation; bucket deleted automatically after stack creation
+- **Stack-scoped log group** - prevents CloudWatch log group conflicts between multiple stacks
 
 ## DISCLAIMER OF WARRANTIES AND LIABILITY
 
