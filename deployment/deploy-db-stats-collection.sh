@@ -13,6 +13,10 @@ INSTANCE_TYPE="t3.medium"
 ENABLE_SCHEDULED="true"
 SCHEDULE="0 6 * * *"
 CODE_KEY="wal-db-stats-collection.zip"
+# Pinned commit for the PGPerfStatsSnapper repo cloned at instance boot (invasive
+# collection). Matches cfn/db-stats-collection.yaml's PgSnapperRepoCommit default.
+# Override with --pgsnapper-commit only after reviewing the target commit.
+PGSNAPPER_REPO_COMMIT="419de312718dd5e73f71a3fdeaceba748fae44da"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -74,6 +78,10 @@ while [[ $# -gt 0 ]]; do
             DB_SECRET_ARNS+=("$2")
             shift 2
             ;;
+        --pgsnapper-commit)
+            PGSNAPPER_REPO_COMMIT="$2"
+            shift 2
+            ;;
         --help)
             echo "Usage: $0 [OPTIONS]"
             echo "Deploy customer data collection environment for GenAI WAL Review"
@@ -101,6 +109,9 @@ while [[ $# -gt 0 ]]; do
             echo "                                                         you have many clusters or don't know ARNs yet."
             echo "                                    --db-secret-arns A --db-secret-arns B  Specific ARNs, one per cluster."
             echo "                                  Wrap ARNs in single quotes if they contain '!' (RDS managed secrets)."
+            echo "  --pgsnapper-commit SHA          Commit SHA to pin the PGPerfStatsSnapper repo clone to"
+            echo "                                  (default: $PGSNAPPER_REPO_COMMIT). Only override after reviewing"
+            echo "                                  the target commit."
             echo "  --help                          Show this help message"
             echo ""
             echo "Customer Data Collection Workflow:"
@@ -348,6 +359,11 @@ ZIP_NAME="wal-db-stats-collection.zip"
 REPO_ROOT="$SCRIPT_DIR/.."
 ZIP_PATH="$REPO_ROOT/$ZIP_NAME"
 
+# Pin the CFN template's git-clone fallback to the exact commit being packaged into
+# the S3 zip above, so the two code sources can never diverge.
+APP_REPO_COMMIT="$(cd "$REPO_ROOT" && git rev-parse HEAD 2>/dev/null || true)"
+APP_REPO_COMMIT="${APP_REPO_COMMIT:-88eb59a002c49f92c258e9e2ebd102879dc24251}"
+
     # Always recreate zip to ensure latest code
     [ -f "$ZIP_PATH" ] && rm -f "$ZIP_PATH"
     echo "📦 Creating code package from repo contents..."
@@ -493,6 +509,8 @@ CFN_PARAMS="[
   {\"ParameterKey\":\"CollectionSchedule\",        \"ParameterValue\":\"$SCHEDULE\"},
   {\"ParameterKey\":\"CodeSourceBucket\",          \"ParameterValue\":\"$CODE_BUCKET\"},
   {\"ParameterKey\":\"CodeSourceKey\",             \"ParameterValue\":\"$CODE_KEY\"},
+  {\"ParameterKey\":\"AppRepoCommit\",             \"ParameterValue\":\"$APP_REPO_COMMIT\"},
+  {\"ParameterKey\":\"PgSnapperRepoCommit\",       \"ParameterValue\":\"$PGSNAPPER_REPO_COMMIT\"},
   {\"ParameterKey\":\"DBSecretArns\",              \"ParameterValue\":\"$CFN_SECRET_ARNS\"}
 ]"
 
