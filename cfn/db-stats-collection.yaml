@@ -76,12 +76,9 @@ Parameters:
     Description: >
       Full 40-character commit SHA to check out from
       github.com/aws-samples/sample-rds-aurora-postgresql-stats-collection when the
-      instance falls back to a live git clone (used only if CodeSourceBucket is not
-      supplied, e.g. deploying this template directly instead of via
-      deploy-db-stats-collection.sh, which always pins this to the exact commit it
-      packaged into the S3 fallback). The instance verifies HEAD matches this SHA
-      after cloning and refuses to run mismatched code. Only change this after
-      reviewing the target commit.
+      instance falls back to a live git clone. The instance verifies HEAD matches
+      this SHA after cloning and refuses to run mismatched code. Only change this
+      after reviewing the target commit.
     Default: '88eb59a002c49f92c258e9e2ebd102879dc24251'
     AllowedPattern: '^[0-9a-f]{40}$'
     ConstraintDescription: Must be a full 40-character git commit SHA.

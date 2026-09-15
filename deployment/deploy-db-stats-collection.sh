@@ -360,9 +360,7 @@ REPO_ROOT="$SCRIPT_DIR/.."
 ZIP_PATH="$REPO_ROOT/$ZIP_NAME"
 
 # Pin the CFN template's git-clone fallback to the exact commit being packaged into
-# the S3 zip above, so the two code sources can never diverge. Falls back to the
-# template's own default (last commit reviewed at release time) when deploying from
-# a tree with no git history (e.g. an extracted release tarball).
+# the S3 zip above, so the two code sources can never diverge.
 APP_REPO_COMMIT="$(cd "$REPO_ROOT" && git rev-parse HEAD 2>/dev/null || true)"
 APP_REPO_COMMIT="${APP_REPO_COMMIT:-88eb59a002c49f92c258e9e2ebd102879dc24251}"
 
