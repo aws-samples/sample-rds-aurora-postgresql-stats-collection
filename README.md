@@ -163,6 +163,7 @@ Wait ~10 minutes for the instance to finish setup after the stack completes.
 | `--stack-name` | No | `wal-db-stats-collection` | CloudFormation stack name |
 | `--enable-scheduled` | No | `true` | Run collection daily automatically |
 | `--schedule` | No | `0 6 * * *` | Cron schedule (daily at 6 AM UTC) |
+| `--pgsnapper-commit` | No | pinned commit reviewed at release time | Commit SHA the instance checks out from `aws-samples/aurora-and-database-migration-labs` (PGPerfStatsSnapper) at boot. The instance verifies the checkout matches this SHA and refuses to run mismatched code. Only override after reviewing the target commit. |
 
 ## Step 2: Access the instance for data collection
 

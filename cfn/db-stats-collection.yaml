@@ -71,6 +71,33 @@ Parameters:
     Description: S3 key for application code zip file
     Default: 'wal-db-stats-collection.zip'
 
+  AppRepoCommit:
+    Type: String
+    Description: >
+      Full 40-character commit SHA to check out from
+      github.com/aws-samples/sample-rds-aurora-postgresql-stats-collection when the
+      instance falls back to a live git clone (used only if CodeSourceBucket is not
+      supplied, e.g. deploying this template directly instead of via
+      deploy-db-stats-collection.sh, which always pins this to the exact commit it
+      packaged into the S3 fallback). The instance verifies HEAD matches this SHA
+      after cloning and refuses to run mismatched code. Only change this after
+      reviewing the target commit.
+    Default: '88eb59a002c49f92c258e9e2ebd102879dc24251'
+    AllowedPattern: '^[0-9a-f]{40}$'
+    ConstraintDescription: Must be a full 40-character git commit SHA.
+
+  PgSnapperRepoCommit:
+    Type: String
+    Description: >
+      Full 40-character commit SHA to check out from
+      github.com/aws-samples/aurora-and-database-migration-labs (PGPerfStatsSnapper),
+      cloned at boot to support invasive collection. The instance verifies HEAD
+      matches this SHA after cloning and refuses to run mismatched code.
+      Only change this after reviewing the target commit.
+    Default: '419de312718dd5e73f71a3fdeaceba748fae44da'
+    AllowedPattern: '^[0-9a-f]{40}$'
+    ConstraintDescription: Must be a full 40-character git commit SHA.
+
   DBSecretArns:
     Type: String
     Default: ''
@@ -411,28 +438,36 @@ Resources:
           sudo -u ec2-user mkdir -p /home/ec2-user/wal-db-stats-collection
           cd /home/ec2-user/wal-db-stats-collection
           
-          # Try git clone first, fallback to S3
-          echo "[INFO] Attempting to clone repository..."
-          if sudo -u ec2-user git clone https://github.com/aws-samples/sample-rds-aurora-postgresql-stats-collection.git . 2>/dev/null; then
-            echo "[OK] Code cloned from GitHub"
-          elif [ ! -z "${CodeSourceBucket}" ]; then
-            echo "[INFO] Git clone failed, downloading from S3..."
-            aws s3 cp "s3://${CodeSourceBucket}/${CodeSourceKey}" /tmp/wal-db-stats-collection.zip || {
-              echo "[ERROR] Both git clone and S3 download failed - deployment cannot continue"
-              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
-              exit 1
-            }
-            sudo -u ec2-user unzip -o -q /tmp/wal-db-stats-collection.zip -d . || {
-              echo "[ERROR] Code extraction failed - deployment cannot continue"
-              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
-              exit 1
-            }
-            rm /tmp/wal-db-stats-collection.zip
-            echo "[OK] Code downloaded from S3"
+          # Try git clone first, pinned to a reviewed commit and verified after checkout.
+          # Falls back to S3 (the package deploy-db-stats-collection.sh built from the
+          # same pinned commit) if the clone or the pin verification fails for any reason.
+          echo "[INFO] Attempting to clone repository (pinned to commit ${AppRepoCommit})..."
+          if sudo -u ec2-user git clone https://github.com/aws-samples/sample-rds-aurora-postgresql-stats-collection.git . 2>/dev/null \
+             && sudo -u ec2-user git checkout --quiet "${AppRepoCommit}" 2>/dev/null \
+             && [ "$(sudo -u ec2-user git rev-parse HEAD)" = "${AppRepoCommit}" ]; then
+            echo "[OK] Code cloned from GitHub and verified at commit ${AppRepoCommit}"
           else
-            echo "[ERROR] Both git clone and S3 download failed - no code source available"
-            /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
-            exit 1
+            echo "[WARN] Git clone or commit pin verification failed, clearing directory and falling back to S3"
+            find . -mindepth 1 -delete 2>/dev/null || true
+            if [ ! -z "${CodeSourceBucket}" ]; then
+              echo "[INFO] Downloading from S3..."
+              aws s3 cp "s3://${CodeSourceBucket}/${CodeSourceKey}" /tmp/wal-db-stats-collection.zip || {
+                echo "[ERROR] Both git clone and S3 download failed - deployment cannot continue"
+                /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+                exit 1
+              }
+              sudo -u ec2-user unzip -o -q /tmp/wal-db-stats-collection.zip -d . || {
+                echo "[ERROR] Code extraction failed - deployment cannot continue"
+                /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+                exit 1
+              }
+              rm /tmp/wal-db-stats-collection.zip
+              echo "[OK] Code downloaded from S3"
+            else
+              echo "[ERROR] Both git clone and S3 download failed - no code source available"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource CustomerDataCollectionInstance --region ${AWS::Region}
+              exit 1
+            fi
           fi
           
           # Validate required files are present
@@ -475,10 +510,20 @@ Resources:
           # Check PostgreSQL status
           systemctl status postgresql --no-pager
           
-          # Setup PGPerfStatsSnapper
+          # Setup PGPerfStatsSnapper, pinned to a reviewed commit and verified after checkout.
+          # Non-fatal on failure: only invasive collection depends on it.
           sudo -u ec2-user mkdir -p /home/ec2-user/pgperfstats
           cd /home/ec2-user/pgperfstats
-          sudo -u ec2-user git clone https://github.com/aws-samples/aurora-and-database-migration-labs.git . || echo "Repository already exists"
+          if [ -d .git ]; then
+            echo "[INFO] PGPerfStatsSnapper already present, skipping clone"
+          elif sudo -u ec2-user git clone https://github.com/aws-samples/aurora-and-database-migration-labs.git . 2>/dev/null \
+             && sudo -u ec2-user git checkout --quiet "${PgSnapperRepoCommit}" 2>/dev/null \
+             && [ "$(sudo -u ec2-user git rev-parse HEAD)" = "${PgSnapperRepoCommit}" ]; then
+            echo "[OK] PGPerfStatsSnapper cloned and verified at commit ${PgSnapperRepoCommit}"
+          else
+            echo "[WARN] PGPerfStatsSnapper clone or commit pin verification failed - invasive collection will not work until this is resolved"
+            find . -mindepth 1 -delete 2>/dev/null || true
+          fi
           
           # Install PGSnapper dependencies for python3.9 (PGSnapper uses #!/usr/bin/python3)
           python3 -m pip install --upgrade pip
