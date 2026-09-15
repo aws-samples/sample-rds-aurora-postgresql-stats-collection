@@ -495,10 +495,25 @@ Resources:
           # Initialize PostgreSQL database
           postgresql-setup --initdb
           
-          # Configure PostgreSQL to use trust authentication for local connections
-          sed -i 's/^local.*all.*all.*peer$/local   all             all                                     trust/' /var/lib/pgsql/data/pg_hba.conf
-          sed -i 's/^host.*all.*all.*127.0.0.1\/32.*ident$/host    all             all             127.0.0.1\/32            trust/' /var/lib/pgsql/data/pg_hba.conf
-          
+          # Unix-socket connections keep the default 'peer' auth - every local psql call
+          # runs as OS user postgres (sudo -u postgres psql), which peer already maps
+          # to the postgres role correctly. No pg_hba change needed for that line.
+          #
+          # The TCP loopback line is narrowed from 'ident' to 'trust', scoped to the
+          # postgres role only (not 'all'). It can't be swapped for password auth:
+          # the upstream pg_perf_stat_loader.py (PGPerfStatsSnapper) always sends the
+          # password it retrieves from the *customer's Aurora* Secrets Manager secret,
+          # which has no relationship to this local, single-tenant analysis database,
+          # so a real local password could never match it. This is safe because
+          # PostgreSQL only listens on localhost (enforced explicitly below), and the
+          # security group has no inbound rule for DBPort - loopback is unreachable
+          # from anywhere but a local process on this single-tenant instance.
+          sed -i 's/^host.*all.*all.*127.0.0.1\/32.*ident$/host    all             postgres        127.0.0.1\/32            trust/' /var/lib/pgsql/data/pg_hba.conf
+
+          # Defense in depth: make the loopback-only bind explicit rather than relying
+          # on PostgreSQL's default (also 'localhost' when unset).
+          sed -i "s/^#listen_addresses = 'localhost'/listen_addresses = 'localhost'/" /var/lib/pgsql/data/postgresql.conf
+
           # Start and enable PostgreSQL service
           systemctl start postgresql
           systemctl enable postgresql
