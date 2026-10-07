@@ -2192,7 +2192,9 @@ WITH health_metrics AS (
     FROM pg_stat_activity WHERE pid != pg_backend_pid()
 ),
 xid_metrics AS (
-    SELECT ROUND((age(datfrozenxid)::numeric / GREATEST(current_setting('autovacuum_freeze_max_age')::numeric, 1) * 100), 1) as xid_age_pct,
+    -- Percentage of the hard 2-billion transaction wraparound limit (not autovacuum_freeze_max_age,
+    -- which is merely the threshold at which PostgreSQL's forced anti-wraparound autovacuum kicks in).
+    SELECT ROUND((age(datfrozenxid)::numeric / 2000000000.0 * 100), 1) as xid_age_pct,
         age(datfrozenxid) as xid_age
     FROM pg_database WHERE datname = current_database()
 ),
