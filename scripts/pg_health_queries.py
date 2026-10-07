@@ -1844,9 +1844,26 @@ SELECT schemaname as "Schema", tablename as "Table", indexname as "Index",
     idx_tup_read as "Rows Read", index_type as "Type",
     CASE WHEN indisprimary THEN 'PRIMARY KEY' WHEN indisunique THEN 'UNIQUE' ELSE 'NORMAL' END as "Category",
     CASE WHEN NOT indisvalid THEN 'INVALID' WHEN idx_scan = 0 THEN 'UNUSED' WHEN idx_scan < 50 THEN 'RARELY USED' ELSE 'HEALTHY' END as "Health",
+    -- NOTE: schemaname = 'pg_toast' and indisprimary/indisunique entries must never get a
+    -- DROP-style recommendation. TOAST indexes are system-managed (the sole lookup path for
+    -- reconstructing out-of-line TOASTed values) and are not droppable via plain DROP INDEX;
+    -- indisprimary/indisunique indexes back a constraint and DROP INDEX fails for them too
+    -- (requires ALTER TABLE ... DROP CONSTRAINT instead, a materially different, higher-risk
+    -- action). The branch below previously excluded indisprimary/indisunique only from the
+    -- "idx_scan = 0" case, not from "idx_scan < 50" — so a PRIMARY KEY index (TOAST indexes
+    -- are always indisprimary) with idx_scan between 1 and 49 fell through to a plain
+    -- "WARNING: Large rarely-used index" with no constraint/system-managed caveat, reading as
+    -- an actionable drop candidate to anyone (human or LLM) scanning this Recommendation column.
     CASE
         WHEN NOT indisvalid THEN 'CRITICAL: Invalid index - REINDEX required'
-        WHEN idx_scan = 0 AND NOT indisprimary AND NOT indisunique THEN
+        WHEN schemaname = 'pg_toast' THEN
+            'INFO: System-managed TOAST index - never DROP (required to reconstruct out-of-line values). ' ||
+            'If genuinely bloated vs. parent table data volume, REINDEX INDEX CONCURRENTLY is safe on ' ||
+            'PostgreSQL 12.10/13.6/14.1+ (earlier minor versions had a bug where REINDEX CONCURRENTLY on ' ||
+            'TOAST tables/indexes could produce a corrupted index); use blocking REINDEX INDEX otherwise.'
+        WHEN indisprimary OR indisunique THEN
+            'OK: Constraint-backed index - DROP INDEX will fail (requires ALTER TABLE ... DROP CONSTRAINT instead); not a plain unused-index cleanup candidate'
+        WHEN idx_scan = 0 THEN
             CASE WHEN index_size_bytes > 100*1024*1024 THEN 'CRITICAL: Large unused index - consider dropping'
                  WHEN index_size_bytes > 10*1024*1024 THEN 'WARNING: Medium unused index - review usage'
                  ELSE 'INFO: Unused index - monitor usage' END
