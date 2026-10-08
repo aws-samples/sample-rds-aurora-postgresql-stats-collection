@@ -1343,6 +1343,12 @@ table_vacuum_info AS (
     SELECT schemaname, relname,
         CASE WHEN n_live_tup + n_dead_tup > 0
             THEN ROUND(100.0 * n_dead_tup / (n_live_tup + n_dead_tup), 2) ELSE 0 END as dead_tuple_pct,
+        -- Carry the total row count forward so the final SELECT can gate CRITICAL/WARNING on
+        -- it, not on dead_tuple_pct alone. Without this floor, an 8-row table at 87.5% dead
+        -- (7 dead rows) reads identically to a genuinely bloated multi-million-row table —
+        -- same materiality bug already fixed for table_io via TABLE_IO_MATERIALITY_FLOOR in
+        -- the GenAI WAL Review agent; this query independently had the same gap.
+        n_live_tup + n_dead_tup as total_tuples,
         n_dead_tup as dead_tuples, last_vacuum, last_autovacuum,
         CASE WHEN last_vacuum IS NOT NULL OR last_autovacuum IS NOT NULL
             THEN EXTRACT(EPOCH FROM (now() - COALESCE(last_vacuum, last_autovacuum))) ELSE NULL END as seconds_since_vacuum
@@ -1377,7 +1383,11 @@ FROM (
         CASE WHEN dead_tuple_pct >= 50 THEN 'CRITICAL: Very high bloat - VACUUM FULL recommended'
              WHEN dead_tuple_pct >= 30 THEN 'WARNING: High dead tuple ratio - schedule VACUUM'
              ELSE 'Dead tuple ratio is acceptable' END
-    FROM table_vacuum_info WHERE dead_tuple_pct >= 20
+    -- Materiality floor (1000 total rows, matching the GenAI WAL Review agent's
+    -- TABLE_IO_MATERIALITY_FLOOR): below it, a single VACUUM/autovacuum pass clears the table
+    -- regardless of how high dead_tuple_pct reads, so it is excluded from this "needs
+    -- attention" list entirely rather than appearing as a false CRITICAL/WARNING row.
+    FROM table_vacuum_info WHERE dead_tuple_pct >= 20 AND total_tuples >= 1000
     UNION ALL
     SELECT 3, 'Autovacuum Configuration', name, setting || COALESCE(' ' || unit, ''),
         CASE WHEN name = 'autovacuum' THEN CASE WHEN setting = 'on' THEN 'Enabled' ELSE 'Disabled' END ELSE setting END,
