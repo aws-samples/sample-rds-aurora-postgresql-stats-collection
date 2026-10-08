@@ -1343,6 +1343,12 @@ table_vacuum_info AS (
     SELECT schemaname, relname,
         CASE WHEN n_live_tup + n_dead_tup > 0
             THEN ROUND(100.0 * n_dead_tup / (n_live_tup + n_dead_tup), 2) ELSE 0 END as dead_tuple_pct,
+        -- Carry the total row count forward so the final SELECT can gate CRITICAL/WARNING on
+        -- it, not on dead_tuple_pct alone. Without this floor, an 8-row table at 87.5% dead
+        -- (7 dead rows) reads identically to a genuinely bloated multi-million-row table —
+        -- same materiality bug already fixed for table_io via TABLE_IO_MATERIALITY_FLOOR in
+        -- the GenAI WAL Review agent; this query independently had the same gap.
+        n_live_tup + n_dead_tup as total_tuples,
         n_dead_tup as dead_tuples, last_vacuum, last_autovacuum,
         CASE WHEN last_vacuum IS NOT NULL OR last_autovacuum IS NOT NULL
             THEN EXTRACT(EPOCH FROM (now() - COALESCE(last_vacuum, last_autovacuum))) ELSE NULL END as seconds_since_vacuum
@@ -1377,7 +1383,11 @@ FROM (
         CASE WHEN dead_tuple_pct >= 50 THEN 'CRITICAL: Very high bloat - VACUUM FULL recommended'
              WHEN dead_tuple_pct >= 30 THEN 'WARNING: High dead tuple ratio - schedule VACUUM'
              ELSE 'Dead tuple ratio is acceptable' END
-    FROM table_vacuum_info WHERE dead_tuple_pct >= 20
+    -- Materiality floor (1000 total rows, matching the GenAI WAL Review agent's
+    -- TABLE_IO_MATERIALITY_FLOOR): below it, a single VACUUM/autovacuum pass clears the table
+    -- regardless of how high dead_tuple_pct reads, so it is excluded from this "needs
+    -- attention" list entirely rather than appearing as a false CRITICAL/WARNING row.
+    FROM table_vacuum_info WHERE dead_tuple_pct >= 20 AND total_tuples >= 1000
     UNION ALL
     SELECT 3, 'Autovacuum Configuration', name, setting || COALESCE(' ' || unit, ''),
         CASE WHEN name = 'autovacuum' THEN CASE WHEN setting = 'on' THEN 'Enabled' ELSE 'Disabled' END ELSE setting END,
@@ -1844,9 +1854,26 @@ SELECT schemaname as "Schema", tablename as "Table", indexname as "Index",
     idx_tup_read as "Rows Read", index_type as "Type",
     CASE WHEN indisprimary THEN 'PRIMARY KEY' WHEN indisunique THEN 'UNIQUE' ELSE 'NORMAL' END as "Category",
     CASE WHEN NOT indisvalid THEN 'INVALID' WHEN idx_scan = 0 THEN 'UNUSED' WHEN idx_scan < 50 THEN 'RARELY USED' ELSE 'HEALTHY' END as "Health",
+    -- NOTE: schemaname = 'pg_toast' and indisprimary/indisunique entries must never get a
+    -- DROP-style recommendation. TOAST indexes are system-managed (the sole lookup path for
+    -- reconstructing out-of-line TOASTed values) and are not droppable via plain DROP INDEX;
+    -- indisprimary/indisunique indexes back a constraint and DROP INDEX fails for them too
+    -- (requires ALTER TABLE ... DROP CONSTRAINT instead, a materially different, higher-risk
+    -- action). The branch below previously excluded indisprimary/indisunique only from the
+    -- "idx_scan = 0" case, not from "idx_scan < 50" — so a PRIMARY KEY index (TOAST indexes
+    -- are always indisprimary) with idx_scan between 1 and 49 fell through to a plain
+    -- "WARNING: Large rarely-used index" with no constraint/system-managed caveat, reading as
+    -- an actionable drop candidate to anyone (human or LLM) scanning this Recommendation column.
     CASE
         WHEN NOT indisvalid THEN 'CRITICAL: Invalid index - REINDEX required'
-        WHEN idx_scan = 0 AND NOT indisprimary AND NOT indisunique THEN
+        WHEN schemaname = 'pg_toast' THEN
+            'INFO: System-managed TOAST index - never DROP (required to reconstruct out-of-line values). ' ||
+            'If genuinely bloated vs. parent table data volume, REINDEX INDEX CONCURRENTLY is safe on ' ||
+            'PostgreSQL 12.10/13.6/14.1+ (earlier minor versions had a bug where REINDEX CONCURRENTLY on ' ||
+            'TOAST tables/indexes could produce a corrupted index); use blocking REINDEX INDEX otherwise.'
+        WHEN indisprimary OR indisunique THEN
+            'OK: Constraint-backed index - DROP INDEX will fail (requires ALTER TABLE ... DROP CONSTRAINT instead); not a plain unused-index cleanup candidate'
+        WHEN idx_scan = 0 THEN
             CASE WHEN index_size_bytes > 100*1024*1024 THEN 'CRITICAL: Large unused index - consider dropping'
                  WHEN index_size_bytes > 10*1024*1024 THEN 'WARNING: Medium unused index - review usage'
                  ELSE 'INFO: Unused index - monitor usage' END
@@ -2192,7 +2219,9 @@ WITH health_metrics AS (
     FROM pg_stat_activity WHERE pid != pg_backend_pid()
 ),
 xid_metrics AS (
-    SELECT ROUND((age(datfrozenxid)::numeric / GREATEST(current_setting('autovacuum_freeze_max_age')::numeric, 1) * 100), 1) as xid_age_pct,
+    -- Percentage of the hard 2-billion transaction wraparound limit (not autovacuum_freeze_max_age,
+    -- which is merely the threshold at which PostgreSQL's forced anti-wraparound autovacuum kicks in).
+    SELECT ROUND((age(datfrozenxid)::numeric / 2000000000.0 * 100), 1) as xid_age_pct,
         age(datfrozenxid) as xid_age
     FROM pg_database WHERE datname = current_database()
 ),
