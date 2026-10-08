@@ -79,7 +79,7 @@ Parameters:
       instance falls back to a live git clone. The instance verifies HEAD matches
       this SHA after cloning and refuses to run mismatched code. Only change this
       after reviewing the target commit.
-    Default: '88eb59a002c49f92c258e9e2ebd102879dc24251'
+    Default: 'a724082d62a21cf8a06e2a880286c2eb6b7675a2'
     AllowedPattern: '^[0-9a-f]{40}$'
     ConstraintDescription: Must be a full 40-character git commit SHA.
 

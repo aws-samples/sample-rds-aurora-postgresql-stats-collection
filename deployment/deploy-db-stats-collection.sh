@@ -362,7 +362,7 @@ ZIP_PATH="$REPO_ROOT/$ZIP_NAME"
 # Pin the CFN template's git-clone fallback to the exact commit being packaged into
 # the S3 zip above, so the two code sources can never diverge.
 APP_REPO_COMMIT="$(cd "$REPO_ROOT" && git rev-parse HEAD 2>/dev/null || true)"
-APP_REPO_COMMIT="${APP_REPO_COMMIT:-88eb59a002c49f92c258e9e2ebd102879dc24251}"
+APP_REPO_COMMIT="${APP_REPO_COMMIT:-a724082d62a21cf8a06e2a880286c2eb6b7675a2}"
 
     # Always recreate zip to ensure latest code
     [ -f "$ZIP_PATH" ] && rm -f "$ZIP_PATH"
