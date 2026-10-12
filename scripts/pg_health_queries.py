@@ -654,6 +654,16 @@ WITH db_role AS (
         CASE WHEN pg_is_in_recovery() THEN 'REPLICA' ELSE 'PRIMARY' END as server_role,
         current_setting('wal_level') as wal_level,
         '{deployment_type}' as deployment
+),
+slot_stats AS (
+    SELECT
+        COUNT(*) AS total_slots,
+        COUNT(*) FILTER (WHERE active) AS active_slots,
+        COUNT(*) FILTER (WHERE NOT active) AS inactive_slots,
+        COUNT(*) FILTER (WHERE slot_type = 'physical') AS physical_slots,
+        COUNT(*) FILTER (WHERE slot_type = 'logical') AS logical_slots,
+        COUNT(*) FILTER (WHERE left(slot_name, 4) = 'rds_') AS rds_slots
+    FROM pg_replication_slots
 )
 SELECT metric, value, description, details, recommendation
 FROM (
@@ -724,21 +734,39 @@ FROM (
         'INFO: Managed by AWS. Configure backup retention in AWS Console',
         3 FROM pg_stat_archiver CROSS JOIN db_role
     UNION ALL
+    -- Value, description, details and recommendation are all derived from the same slot
+    -- counts (slot_stats below), so the row can't say "Active (2 slot(s))" and
+    -- "No replication slots" at once. slot_type is captured because physical slots (standbys,
+    -- read replicas) and logical slots (CDC/logical replication consumers) need different
+    -- follow-up. Slots named rds_* are the ones RDS creates for its own replicas/standbys.
     SELECT 'WAL-Based Replication',
-        CASE WHEN wal_level IN ('logical', 'replica') AND (SELECT COUNT(*) FROM pg_replication_slots) > 0
-            THEN 'Active (' || (SELECT COUNT(*)::text FROM pg_replication_slots) || ' slot(s))'
+        CASE WHEN s.total_slots > 0
+                THEN s.total_slots::text || ' slot(s): ' || s.active_slots::text || ' active, '
+                     || s.inactive_slots::text || ' inactive'
             WHEN wal_level IN ('logical', 'replica') THEN 'Configured (no slots)'
             ELSE 'Not configured' END,
-        CASE WHEN wal_level IN ('logical', 'replica')
-            THEN 'User-configured WAL replication detected. WAL accumulation requires monitoring'
-            ELSE 'WAL level does not support replication' END,
-        CASE WHEN (SELECT COUNT(*) FROM pg_replication_slots WHERE NOT active) > 0
-            THEN 'INACTIVE SLOTS: ' || (SELECT COUNT(*)::text FROM pg_replication_slots WHERE NOT active)
+        CASE WHEN s.total_slots = 0 AND wal_level IN ('logical', 'replica')
+                THEN 'wal_level supports replication; no replication slots exist'
+            WHEN s.total_slots = 0
+                THEN 'WAL level does not support replication'
+            WHEN s.total_slots = s.rds_slots
+                THEN 'All slots use the rds_ naming RDS applies to the slots it creates for replicas/standbys. WAL is retained on this instance until each slot''s consumer confirms it'
+            ELSE 'Replication slots present, including ' || (s.total_slots - s.rds_slots)::text
+                 || ' not named with the rds_ prefix (likely user-created). WAL is retained on this instance until each slot''s consumer confirms it'
+        END,
+        CASE WHEN s.total_slots > 0
+                THEN 'Types: ' || s.physical_slots::text || ' physical, ' || s.logical_slots::text
+                     || ' logical. rds_-prefixed: ' || s.rds_slots::text || ' of ' || s.total_slots::text
             ELSE 'No replication slots' END,
-        CASE WHEN (SELECT COUNT(*) FROM pg_replication_slots WHERE NOT active) > 0
-            THEN 'CRITICAL: Drop inactive slots to prevent WAL buildup. Storage grows with WAL accumulation - direct cost impact'
-            ELSE 'INFO: No WAL-based replication configured' END,
-        4 FROM db_role
+        CASE WHEN s.inactive_slots > 0
+                THEN 'CRITICAL: ' || s.inactive_slots::text || ' inactive slot(s) retain WAL and grow storage until consumed '
+                     || '(watch TransactionLogsDiskUsage). Identify each slot''s consumer; drop a user-created slot '
+                     || 'with pg_drop_replication_slot() only if it is no longer needed. Leave rds_-prefixed slots to RDS.'
+            WHEN s.total_slots > 0
+                THEN 'INFO: All ' || s.total_slots::text || ' slot(s) active. Monitor OldestReplicationSlotLag '
+                     || '(WAL not yet consumed by the most lagging slot) and TransactionLogsDiskUsage.'
+            ELSE 'INFO: No replication slots to monitor' END,
+        4 FROM db_role CROSS JOIN slot_stats s
 ) AS replication_metrics ORDER BY sort_order;
 """
 
@@ -1867,10 +1895,15 @@ SELECT schemaname as "Schema", tablename as "Table", indexname as "Index",
     CASE
         WHEN NOT indisvalid THEN 'CRITICAL: Invalid index - REINDEX required'
         WHEN schemaname = 'pg_toast' THEN
-            'INFO: System-managed TOAST index - never DROP (required to reconstruct out-of-line values). ' ||
-            'If genuinely bloated vs. parent table data volume, REINDEX INDEX CONCURRENTLY is safe on ' ||
-            'PostgreSQL 12.10/13.6/14.1+ (earlier minor versions had a bug where REINDEX CONCURRENTLY on ' ||
-            'TOAST tables/indexes could produce a corrupted index); use blocking REINDEX INDEX otherwise.'
+            -- Version floors cover two upstream CONCURRENTLY defects: TOAST-index corruption
+            -- (fixed in 12.10/13.6/14.2) and rows missed by CONCURRENTLY builds on 14.0-14.3
+            -- (fixed in 14.4). Kept identical to TOAST_RECOMMENDATION in the WAL review app's
+            -- scripts/patch_collector_data.py so its load-time patch treats this as already fixed.
+            'INFO: System-managed TOAST index - keep it (DROP INDEX can''t remove it; PostgreSQL needs it ' ||
+            'to read out-of-line values). If pgstatindex() shows bloat, rebuild with REINDEX INDEX ' ||
+            'CONCURRENTLY on PostgreSQL 12.10+, 13.6+, 14.4+ or 15+ (earlier minor versions have known ' ||
+            'CONCURRENTLY defects); otherwise use REINDEX INDEX in a maintenance window. Test on a clone ' ||
+            'and confirm pg_index.indisvalid afterward.'
         WHEN indisprimary OR indisunique THEN
             'OK: Constraint-backed index - DROP INDEX will fail (requires ALTER TABLE ... DROP CONSTRAINT instead); not a plain unused-index cleanup candidate'
         WHEN idx_scan = 0 THEN
